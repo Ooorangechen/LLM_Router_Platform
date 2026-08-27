@@ -1,10 +1,61 @@
+# LLM Router Platform — 依赖清单
+# Python 要求：>= 3.9（开发/生产推荐 3.11）
+
+# Web 框架
 fastapi>=0.104
 uvicorn[standard]>=0.24
+
+# 数据校验 / Schema
 pydantic>=2.5
 pydantic-settings>=2.1
+
+# 配置文件格式
 pyyaml>=6.0
+
+# 结构化日志
 structlog>=23.2
 python-json-logger>=2.0
-click>=8.1
+loguru>=0.7
+
+# 指标采集
 prometheus-client>=0.19
+
+# CLI 命令框架
+click>=8.1
+
+# HTTP Client（后续阶段使用）
 httpx>=0.25
+aiohttp>=3.9
+
+# 消息队列（后续阶段使用）
+aiokafka>=0.8
+kafka-python>=2.0
+
+# 分析数据库（后续阶段使用）
+clickhouse-connect>=0.6
+
+# 缓存（后续阶段使用）
+redis>=5.0
+
+
+# 前端控制台（后续阶段使用）
+streamlit>=1.28
+plotly>=5.18
+pandas>=2.0
+
+# 异步编排（后续阶段使用）
+langgraph>=0.0.20
+langchain-core>=0.1
+
+# 模型微调（后续阶段使用）
+peft>=0.7
+transformers>=4.36
+datasets>=2.16
+torch>=2.1
+
+# 代码质量（可选）
+pytest>=7.4
+pytest-asyncio>=0.21
+black>=23.0
+flake8>=6.0
+mypy>=1.7

@@ -12,7 +12,7 @@ class SystemMetrics:
         self.requests_total = Counter("llm_router_requests_total", 
                                       "total requests received", 
                                       ["endpoint", "method", "status"])
-        self.request_duration = Histogram("llm_router_request_duration", 
+        self.request_duration = Histogram("llm_router_request_duration_seconds", 
                                           "HTTP request duration",
                                           labelnames=["endpoint", "method"],
                                           buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0,float("inf")],
@@ -55,11 +55,11 @@ class RouterMetrics:
     Routing Metrics used for routing module. 
     """
     def __init__(self):
-        self.routing_decisions = Counter("llm_router_router_routing_decisions", 
+        self.routing_decisions = Counter("llm_router_router_routing_decisions_total", 
                                          "number of routing decision made",
                                          labelnames=["model", "query_type"])
 
-        self.routing_latency = Histogram("llm_router_router_routing_latency",
+        self.routing_latency = Histogram("llm_router_router_routing_latency_ms",
                                          "routing decision latency in ms", 
                                          buckets=[1,5,10,25,50,100,250,500, 1000, float("inf")])
 
@@ -72,12 +72,12 @@ class RouterMetrics:
                                         "number of avaibale models",
                                         labelnames=["model", "provider"])
 
-        self.query_classifications = Counter("llm_router_router_query_classifications",
-                                             "number of queries in each type", 
+        self.query_classifications = Counter("llm_router_router_query_classifications_total",
+                                             "total number of queries in each type", 
                                              labelnames=["query_type", "confidence_bucket"])
 
-        self.fallback_usage = Counter("llm_router_router_fallback_usage", 
-                                      "fall back usage",
+        self.fallback_usage = Counter("llm_router_router_fallback_usage_total", 
+                                      "total router fallback usage",
                                       labelnames=["original_model", "fallback_model", "reason"])
 
 
@@ -90,7 +90,7 @@ class InferenceMetrics:
         self.requests_total = Counter("llm_router_inference_requests_total",
                                       "total number of inference requests",
                                       labelnames=["model", "provider"])
-        self.request_duration = Histogram("llm_router_inference_request_duration", 
+        self.request_duration = Histogram("llm_router_inference_request_duration_seconds", 
                                            "inference requests duration",
                                            labelnames=["model","provider"],
                                            buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, float("inf")]
@@ -104,10 +104,10 @@ class InferenceMetrics:
                                        "total inference cost in usd",
                                        labelnames=["model"])
 
-        self.cache_hits = Counter("llm_router_inference_cache_hits",
-                                  "Number of inference cache hits")
-        self.cache_misses = Counter("llm_router_inference_cache_misses",
-                                    "Number of inference cache misses")
+        self.cache_hits = Counter("llm_router_inference_cache_hits_total",
+                                  "total number of inference cache hits")
+        self.cache_misses = Counter("llm_router_inference_cache_misses_total",
+                                    "total number of inference cache misses")
 
         self.compressions_total = Counter("llm_router_inference_compressions_total",
                                           "total number of inference compressions",
@@ -127,23 +127,23 @@ class PipelineMetrics:
     Pipeline Metrics 
     """
     def __init__(self):
-        self.messages_produced = Counter("llm_router_pipeline_messages_produced",
-                                         "Number of messages produced in pipeline",
+        self.messages_produced = Counter("llm_router_pipeline_messages_produced_total",
+                                         "total number of messages produced in pipeline",
                                          labelnames=["topic"])
-        self.messages_consumed = Counter("llm_router_pipeline_messages_consumed",
-                                         "Number of messages consumed in pipeline",
+        self.messages_consumed = Counter("llm_router_pipeline_messages_consumed_total",
+                                         "total number of messages consumed in pipeline",
                                          labelnames=["topic", "group_id"])
 
-        self.producer_errors = Counter("llm_router_pipeline_producer_errors",
-                                       "number of producer errors") 
-        self.consumer_errors = Counter("llm_router_pipeline_consumer_errors",
-                                       "number of consumer errors")
+        self.producer_errors = Counter("llm_router_pipeline_producer_errors_total",
+                                       "total number of producer errors") 
+        self.consumer_errors = Counter("llm_router_pipeline_consumer_errors_total",
+                                       "total number of consumer errors")
 
         self.db_writes_total = Counter("llm_router_pipeline_db_writes_total",
-                                       "number of databse writes",
+                                       "total number of databse writes",
                                        labelnames=["table", "status"])
 
-        self.db_write_latency = Histogram("llm_router_pipeline_db_write_latency",
+        self.db_write_latency = Histogram("llm_router_pipeline_db_write_latency_ms",
                                         "latency of database writes in ms",
                                         labelnames=["table"],
                                         buckets=[1,5,10,25,50,100,250,500, 1000, float("inf")])

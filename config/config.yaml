@@ -1,2 +1,155 @@
 ## 全平台配置文件，按section分层
 ## api / logging / router / ...
+api:
+  host: "0.0.0.0"
+  port: 8080
+  log_level: info
+  cors_origins:
+    - "*"
+  rate_limiting:
+    enabled: false
+    rpm: 60
+    burst_size: 10
+
+logging:
+  level: info
+  file: logs/llm_router.log
+  max_bytes: 10485760
+  backup_count: 5
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+router:
+  default_model: mistral-7b
+  routing_strategy: intelligent
+  models: 
+    mistral-7b:
+      provider: vllm
+      api_key_env: VLLM_API_KEY
+      max_tokens: 8192
+      cost_per_token: 0.0
+      priority: 1
+      capabilities:
+        - general
+        - math
+      gpu_memory_gb: 16
+    gpt-4-turbo:
+      provider: openai
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 4096
+      cost_per_token: 1.5e-05
+      priority: 2
+      capabilities:
+        - coding
+        - reasoning
+        - analysis
+        - general
+    claude-3.5-sonnet:
+      provider: anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens: 8192
+      cost_per_token: 6.0e-06
+      priority: 2
+      capabilities:
+        - writing
+        - creative
+        - analysis
+        - reasoning
+        - general
+    llama-3.1-70b: 
+      provider: vllm
+      api_key_env: VLLM_API_KEY
+      max_tokens: 8192
+      cost_per_token: 0.0
+      priority: 1
+      capabilities:
+        - reasoning
+        - analysis
+        - general
+        - translation
+      gpu_memory_gb: 160
+
+  routing_rules:
+    - name: code_generation
+      condition: "query_type == 'code_generation'"
+      target_model: gpt-4-turbo
+    - name: long_context_analysis
+      condition: "query_type == 'analysis' and context_length > 20000"
+      target_model: claude-3.5-sonnet
+    - name: premium_tier
+      condition: "user_tier == 'premium'"
+      target_model: claude-3.5-sonnet
+    - name: free_tier
+      condition: "user_tier == 'free'"
+      target_model: mistral-7b
+
+inference:
+  vllm:
+    host: localhost
+    port: 8001
+    base_url: http://localhost:8001/v1
+    timeout: 60
+    retries: 3
+  openai:
+    host: api.openai.com
+    port: 443
+    base_url: https://api.openai.com/v1
+    timeout: 30
+    retries: 3
+  anthropic:
+    host: api.anthropic.com
+    port: 443
+    base_url: https://api.anthropic.com/v1
+    timeout: 30
+    retries: 3
+  compression:
+    enabled: false
+    max_context_tokens: 100000
+    compression_ratio: 0.5
+    method: summarization
+  cache:
+    enabled: false
+    backend: redis
+    ttl: 3600
+    max_size: 10000
+  batching:
+    enabled: false
+    max_batch_size: 32
+    max_wait_time_ms: 100
+  
+kafka:
+  enabled: false
+  bootstrap_servers: localhost:9092
+
+  topics:
+    queries: llm-router-queries
+    responses: llm-router-responses
+    metrics: llm-router-metrics
+    errors: llm-router-errors
+  
+  producer:
+    acks: all
+    retries: 3
+    batch_size: 16384
+    linger_ms: 10
+    compression_type: gzip
+  
+  consumer:
+    group_id: llm-router-consumer-group
+    auto_offset_reset: earliest
+    enable_auto_commit: true
+    max_poll_records: 500
+
+clickhouse:
+  enabled: false
+  host: localhost
+  port: 8123
+  database: llm_router
+  username: default
+  password_env: CLICKHOUSE_PASSWORD
+
+  tables:
+    query_logs: query_logs
+    system_metrics: system_metrics
+    model_performance: model_performance
+    user_analytics: user_analytics
+

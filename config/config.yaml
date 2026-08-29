@@ -153,3 +153,193 @@ clickhouse:
     model_performance: model_performance
     user_analytics: user_analytics
 
+monitoring:
+  enabled: false
+  prometheus_port: 8000
+
+  prometheus:
+    scrape_interval: 15s
+  
+  grafana:
+    port: 3000
+    admin_user: admin
+    admin_password_env: GRAFANA_ADMIN_PASSWORD
+  
+  alerts:
+    error_rate_threshold: 0.05
+    latency_p95_threshold_ms: 2000
+    cpu_usage_threshold: 0.85
+    memory_usage_threshold: 0.85
+  
+  health_checks:
+    interval: 30s
+    timeout: 5s
+  
+slack:
+  enabled: false
+  bot_token_env: SLACK_BOT_TOKEN
+  app_token_env: SLACK_APP_TOKEN
+  signing_secret_env: SLACK_SIGNING_SECRET
+
+  channels:
+    - general
+    - llm-router-alerts
+  
+  response_settings:
+    max_response_length: 3000
+    thread_replies: true
+    typing_indicator: true
+  
+  rate_limiting:
+    enabled: true
+    rpm: 20
+
+streamlit:
+  enabled: true
+  port: 8501
+  host: "0.0.0.0"
+
+  theme:
+    mode: dark
+    primary_color: "#FF6B6B"
+    background_color: "#0E1117"
+  
+  dashboard:
+    refresh_interval_seconds: 10
+    default_time_range_hours: 24
+  
+flink:
+  enabled: false
+  job_manager:
+    host: localhost
+    port: 8081
+  parallelism: 2
+  checkpointing:
+    enabled: true
+    interval_ms: 60000
+    mode: exactly_once
+
+security:
+  api_keys:
+    enabled: false
+    header_name: X-API-Key
+  jwt: 
+    enabled: false
+    secret_env: JWT_SECRET
+    algorithm: HS256
+    expiration_hours: 24
+  cors:
+    allow_credentials: true
+    allow_methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+    allow_headers:
+      - "*"
+
+performance:
+  connection_pools:
+    database:
+      min_size: 2
+      max_size: 10
+    http:
+      min_size: 5
+      max_size: 50
+  workers:
+    api: 4
+    inference: 2
+    pipeline: 2
+  memory:
+    heap_size_mb: 2048
+    gc_threshold: 0.8
+
+development: 
+  debug: false
+  auto_reload: false
+  profiling: false
+  mock_external_apis: false
+
+features:
+  context_compression: false
+  semantic_caching: false
+  batch_processing: false
+  multi_modal: false
+  function_calling: false
+  streaming_responses: false
+
+pipeline:
+  enabled: false
+
+adapters:
+  enabled: false
+  registry_path: data/adapters/registry.json
+
+  selection:
+    strategy: static
+    canary:
+      enabled: false
+      stages: 
+        - 5
+        - 20
+        - 100
+  training:
+    base_model: mistral-7b
+    method: lora
+    learning_rate: 0.0002
+    epochs: 3
+    batch_size: 8
+
+policies: 
+  quota:
+    tier_quotas:
+      free: 
+        daily: 100
+        hourly: 10
+      premium:
+        daily: 1000
+        hourly: 100
+      enterprise:
+        daily: 10000
+        hourly: 1000
+
+  sla:
+    latency_slas:
+      free: 10s
+      premium: 5s
+      enterprise: 2s
+  
+  budget: 
+    cost_budgets:
+      free: 0.01
+      premium: 0.10
+      enterprise: 1.00
+  
+  circuit_breaker: 
+    enabled: true
+    failure_threshold: 5
+    recovery_timeout_s: 30
+  
+optimization:
+  enabled: false
+  kv_cache_size_gb: 8
+  max_batch_size: 32
+  max_wait_ms: 100
+  flash_attn: true
+  tensorrt: false
+
+quality:
+  monitor:
+    enabled: false
+    window_size: 100
+    window_duration_minutes: 60
+
+  slo_targets:
+    availability: 0.999
+    latency_p95_ms: 2000
+    error_rate_max: 0.01
+  
+  feedback:
+    storage_path: data/feedback
+  
+  health_check_interval_s: 30

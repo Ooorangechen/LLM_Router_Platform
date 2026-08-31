@@ -343,3 +343,6 @@ quality:
     storage_path: data/feedback
   
   health_check_interval_s: 30
+
+router_mode:
+  use_integrated_router: false

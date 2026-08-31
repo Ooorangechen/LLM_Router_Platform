@@ -1,16 +1,13 @@
-### CLI 入口 (click group)
-### + FastAPI应用创建 + 服务生命周期编排
-### _setup_logging, _load_config, _create_fastapi_app
-### _signal_handler, _initialize, _start, _shutdown 
+import os
 import sys
+import json
 import time
+import signal
 import asyncio
+from pathlib import Path
 
 import click
 import yaml
-import uvicorn
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 from src.llm_router_part0_setup import setup_project_environment
 from src.utils.logger import setup_logging, get_logger
@@ -134,6 +131,7 @@ class LLMRouterPlatform:
         self.logger.info("All services initialized successfully")
 
     async def _start_services(self):
+        import uvicorn
         app = self._create_fastapi_app()
 
         if _PROM_AVAILABLE:
@@ -164,11 +162,16 @@ class LLMRouterPlatform:
 
     def _signal_handler(self, signum, frame):
         self.logger.info(f"Received signal {signum}. Shutting down...")
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._shutdown_services())
+        except RuntimeError:
+            pass
         sys.exit(0)
 
-
-    #########
     def _create_fastapi_app(self):
+        from fastapi import FastAPI, HTTPException
+        from fastapi.middleware.cors import CORSMiddleware
         app = FastAPI(
             title="LLM Router & Execution Platform",
             description="Production-grade multi-model deployment system with adaptive routing",
@@ -196,9 +199,16 @@ class LLMRouterPlatform:
                     elif hasattr(service, "get_health_status"):
                         service_status[name] = service.get_health_status()
                     else:
-                        service_status[name] = True
+                        service_status[name] = {"healthy": True}
 
-                all_ok = all(service_status.values()) if service_status else True
+                # §3.6.2 requires all_ok = all services healthy
+                # （bool / dict）,  all(values()) will return True when empty dict 
+                # even {"healthy": False} will count as healthy.
+                def _is_ok(v):
+                    return v.get("healthy", False) if isinstance(v, dict) else bool(v)
+
+                all_ok = all(_is_ok(v) for v in service_status.values()) \
+                    if service_status else True
                 return {
                     "status": "healthy" if all_ok else "degraded",
                     "services": service_status,
@@ -227,8 +237,11 @@ class LLMRouterPlatform:
             try:
                 self.config = self._load_config()
                 return {"status": "config_reloaded"}
-            except Exception as exc:
-                return {"status": "error", "error": str(exc)}
+            except BaseException as exc:
+                # §3.5 要求 _load_config 遇到坏配置时 sys.exit(1)，而 sys.exit 抛的是
+                # SystemExit —— 它继承 BaseException 而非 Exception，用 except Exception
+                # 抓不住，进程会被直接杀掉。这里用 BaseException 才能满足「异常 500」。
+                raise HTTPException(status_code=500, detail=str(exc))
 
         @app.get("/admin/services")
         async def admin_services():
@@ -238,3 +251,97 @@ class LLMRouterPlatform:
             }
 
         return app
+        
+    async def run(self):
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+        await self._initialize_services()
+        await self._start_services()
+
+app = None
+
+if os.getenv("LLM_ROUTER_DEV_MODE") == "true":
+    _dev_platform = LLMRouterPlatform(
+        config_path=os.getenv("LLM_ROUTER_CONFIG", DEFAULT_CONFIG_PATH)
+    )
+    app = _dev_platform._create_fastapi_app()
+
+    @app.on_event("startup")
+    async def _dev_startup():
+        await _dev_platform._initialize_services()
+
+@click.group()
+def cli():
+    pass
+
+@cli.command()
+def setup():
+    """初始化项目目录结构与模板文件。"""
+    try:
+        setup_project_environment()
+        click.echo("Setup completed.")
+    except Exception as exc:
+        click.echo(f"Setup failed: {exc}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.option("--config", "config_path", default=DEFAULT_CONFIG_PATH,
+              show_default=True, help="Config path")
+@click.option("--dev", is_flag=True, default=False,
+              help="Dev: auto restart after code changes")
+def start(config_path, dev):
+    if dev:
+        import uvicorn
+        os.environ["LLM_ROUTER_DEV_MODE"] = "true"
+        os.environ["LLM_ROUTER_CONFIG"] = config_path
+
+        platform = LLMRouterPlatform(config_path)
+        port = platform.config.get("api", {}).get("port", 8080)
+        uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+        return
+
+    platform = LLMRouterPlatform(config_path)
+    try:
+        asyncio.run(platform.run())
+    except KeyboardInterrupt:
+        click.echo("Shutting down gracefully...")
+
+
+@cli.command()
+@click.option("--service", default=None, help="Checking the health status of one service")
+def health(service):
+    import httpx
+    try:
+        resp = httpx.get("http://localhost:8080/health", timeout=5.0)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        click.echo(f"Health check failed: {exc}", err=True)
+        sys.exit(1)
+
+    if service:
+        result = payload.get("services", {}).get(service, {"error": "not found"})
+        click.echo(json.dumps(result, indent=2))
+    else:
+        click.echo(json.dumps(payload, indent=2))
+
+
+@cli.command()
+@click.option("--output-dir", "output_path", default="deploy",
+              show_default=True, help="Deploy the required templates.")
+def deploy(output_path):
+    try:
+        base = Path(output_path)
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "docker").mkdir(exist_ok=True)
+        (base / "k8s").mkdir(exist_ok=True)
+        click.echo(f"Deploy scaffold created under {base}/ (P1 stub).")
+    except Exception as exc:
+        click.echo(f"Deploy failed: {exc}", err=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()

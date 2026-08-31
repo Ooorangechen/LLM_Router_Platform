@@ -1,0 +1,32 @@
+{
+  "topics": [
+    {
+      "name": "llm-router-queries",
+      "partitions": 3,
+      "replication_factor": 1,
+      "retention_ms": 604800000,
+      "compression_type": "gzip"
+    },
+    {
+      "name": "llm-router-responses",
+      "partitions": 3,
+      "replication_factor": 1,
+      "retention_ms": 604800000,
+      "compression_type": "gzip"
+    },
+    {
+      "name": "llm-router-metrics",
+      "partitions": 3,
+      "replication_factor": 1,
+      "retention_ms": 259200000,
+      "compression_type": "gzip"
+    },
+    {
+      "name": "llm-router-errors",
+      "partitions": 3,
+      "replication_factor": 1,
+      "retention_ms": 1209600000,
+      "compression_type": "gzip"
+    }
+  ]
+}

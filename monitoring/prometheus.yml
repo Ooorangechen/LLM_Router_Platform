@@ -1,0 +1,41 @@
+# P1 template, activated in P4
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["localhost:9093"]
+
+scrape_configs:
+  - job_name: "api"
+    static_configs:
+      - targets: ["localhost:8000"]
+
+  - job_name: "inference"
+    static_configs:
+      - targets: ["localhost:8001"]
+
+  - job_name: "vllm"
+    static_configs:
+      - targets: ["localhost:8002"]
+
+  - job_name: "kafka-exporter"
+    static_configs:
+      - targets: ["localhost:9308"]
+
+  - job_name: "clickhouse-exporter"
+    static_configs:
+      - targets: ["localhost:9116"]
+
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["localhost:9100"]
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

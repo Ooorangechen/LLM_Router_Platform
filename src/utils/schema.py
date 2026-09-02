@@ -98,9 +98,12 @@ class QueryRequest(BaseModel):
     attachments: List[Attachment] = []
 
     ## metadata
-    ### type not confirmed yet for session_id and conversation_id.
-    session_id: str
-    conversation_id: str
+    # Session_id and conversation_id need to be optional 
+    # P2 /route default only have:
+    # query 、 user_id 、 user_tier 、 
+    # context 、 max_tokens 、 temperature 
+    session_id: Optional[str] = None
+    conversation_id: Optional[str] = None
     metadata: Dict[str, Any] = {}
 
     @field_validator("attachments")

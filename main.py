@@ -11,6 +11,7 @@ import yaml
 
 from src.llm_router_part0_setup import setup_project_environment
 from src.utils.logger import setup_logging, get_logger
+import src.utils.metrics  
 
 DEFAULT_CONFIG_PATH = "config/config.yaml"
 
@@ -123,6 +124,14 @@ class LLMRouterPlatform:
             kwargs["max_bytes"] = log_cfg["max_bytes"]
         if "backup_count" in log_cfg:
             kwargs["backup_count"] = log_cfg["backup_count"]
+        if "console_output" in log_cfg:
+            kwargs["console_output"] = log_cfg["console_output"]
+        if "structured_logs" in log_cfg:
+            kwargs["structured_logs"] = log_cfg["structured_logs"]
+        if "format" in log_cfg:
+            kwargs["log_format"] = log_cfg["format"]
+        if "json_format" in log_cfg:
+            kwargs["json_format"] = log_cfg["json_format"]
         setup_logging(**kwargs)
 
     async def _initialize_services(self):

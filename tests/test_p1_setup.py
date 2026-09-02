@@ -142,3 +142,20 @@ def test_no_plaintext_secrets_in_templates(scaffold):
             if token in text:
                 offenders.append(f"{name}: contains {token!r}")
     assert not offenders, offenders
+
+
+def test_config_template_matches_the_shipped_config(project_root):
+    """The embedded template and config/config.yaml are the same artifact (D6).
+
+    Editing one without the other is exactly how the quality.feedback defaults
+    drifted, so this pins them together: a fresh `setup` must reproduce the file
+    the project actually ships.
+    """
+    from src.llm_router_part0_setup import CONFIG_TEMPLATE
+
+    shipped = (project_root / CONFIG_REL_PATH).read_text(encoding="utf-8")
+
+    assert CONFIG_TEMPLATE == shipped, (
+        "config/config.yaml and part0_setup.CONFIG_TEMPLATE have diverged, "
+        "re-sync the template after editing the config"
+    )

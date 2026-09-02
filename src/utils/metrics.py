@@ -2,7 +2,27 @@
 # SystemMetrics / RouterMetrics / InferenceMetrics / PipelineMetrics四件套
 # P1 只做到实例化，定义类型，先不进行业务埋点
 
-from prometheus_client import Counter, Gauge, Histogram, Info, Enum
+try:
+    from prometheus_client import Counter, Gauge, Histogram, Info, Enum
+    PROM_AVAILABLE = True
+except Exception:
+    PROM_AVAILABLE = False
+
+    class _NoOpMetric:
+        """
+        _noop returns self when prometheus_client not avaiable 
+        ROUTER_METRICS.routing_decisions.labels(model=m).inc() simply does nothing.
+        """
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __getattr__(self, name):
+            return self._noop
+
+        def _noop(self, *args, **kwargs):
+            return self
+        
+    Counter = Gauge = Histogram = Info = Enum = _NoOpMetric
 
 class SystemMetrics:
     """
@@ -157,9 +177,8 @@ SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
 INFERENCE_METRICS = InferenceMetrics()
 PIPELINE_METRICS = PipelineMetrics()
-# create once, then prometheus will register to the global. 
-# load once at creation, then all the other modules share the same,
-# use .lables()...inc() ot update isntead of creating new 
+# create once, then prometheus will register to the global.
+# load once at creation, then all the other modules share the same default registry
 
 if __name__ == "__main__":
     print("SystemMetrics:", SYSTEM_METRICS)

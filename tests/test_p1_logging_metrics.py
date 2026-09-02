@@ -133,3 +133,62 @@ def test_all_four_singletons_are_distinct_instances():
     instances = [SYSTEM_METRICS, ROUTER_METRICS, INFERENCE_METRICS, PIPELINE_METRICS]
 
     assert len({id(instance) for instance in instances}) == 4
+
+
+def test_both_formatters_come_from_config(tmp_path):
+    """3.3 core constraint: all logging configuration is centralised in
+    setup_logging. Neither the text nor the JSON format may be baked into
+    logger.py in a way config.yaml cannot override.
+
+    Goes through the real chain: config.yaml -> main._setup_logging -> setup_logging.
+    """
+    import json as json_module
+
+    import yaml as yaml_module
+
+    from main import LLMRouterPlatform
+
+    log_file = tmp_path / "x.log"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml_module.safe_dump({
+            "api": {"port": 8080},
+            "logging": {
+                "level": "INFO",
+                "file": str(log_file),
+                "format": "TXT|%(levelname)s|%(message)s",
+                "json_format": "%(levelname)s %(message)s %(module)s",
+                "console_output": False,
+                "structured_logs": True,
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    try:
+        platform = LLMRouterPlatform(str(config_path))
+        platform.logger.info("format passthrough check")
+
+        assert "TXT|INFO|format passthrough check" in log_file.read_text(encoding="utf-8")
+
+        lines = (tmp_path / "x.log.jsonl").read_text(encoding="utf-8").splitlines()
+        record = json_module.loads([line for line in lines if line][-1])
+        # exactly the configured fields, so the module constant is not what drove it
+        assert set(record) == {"levelname", "message", "module"}
+    finally:
+        for handler in list(logging.getLogger(NAMESPACE).handlers):
+            handler.close()
+        setup_logging()
+
+
+def test_config_yaml_declares_both_formats(real_config_path):
+    """3.5.1: the logging section carries every setup_logging parameter."""
+    import yaml as yaml_module
+
+    logging_cfg = yaml_module.safe_load(
+        real_config_path.read_text(encoding="utf-8")
+    )["logging"]
+
+    for key in ("level", "file", "max_bytes", "backup_count",
+                "format", "json_format", "console_output", "structured_logs"):
+        assert key in logging_cfg, f"logging.{key} missing from config.yaml"

@@ -17,6 +17,9 @@ logging:
   max_bytes: 10485760
   backup_count: 5
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  json_format: "%(asctime)s %(name)s %(levelname)s %(message)s %(process)d %(thread)d %(module)s %(lineno)d"
+  console_output: true
+  structured_logs: true
 
 router:
   default_model: mistral-7b

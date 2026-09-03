@@ -40,7 +40,7 @@ class LLMRouterPlatform:
     def _load_config(self) -> dict:
         """
         Read from config.yaml,
-        Use default values when missing sections. 
+        Use default values when missing sections.
         """
         try:
             with open(self.config_path, "r") as f:
@@ -57,16 +57,91 @@ class LLMRouterPlatform:
             "port": 8080,
             "log_level": "info",
             "cors_origins": ["*"],
+            "rate_limiting": {
+                "enabled": False,
+                "rpm": 60,
+                "burst_size": 10,
+            },
         })
         config.setdefault("router", {
             "default_model": "mistral-7b",
             "routing_strategy": "intelligent",
-            "models": {},
-            "routing_rules": [],
+            "models": {
+                "mistral-7b": {
+                    "provider": "vllm",
+                    "api_key_env": "VLLM_API_KEY",
+                    "max_tokens": 8192,
+                    "cost_per_token": 0.0,
+                    "priority": 1,
+                    "capabilities": ["general", "math"],
+                    "gpu_memory_gb": 16,
+                },
+                "gpt-4-turbo": {
+                    "provider": "openai",
+                    "api_key_env": "OPENAI_API_KEY",
+                    "max_tokens": 4096,
+                    "cost_per_token": 1.5e-05,
+                    "priority": 2,
+                    "capabilities": ["coding", "reasoning", "analysis", "general"],
+                },
+                "claude-3.5-sonnet": {
+                    "provider": "anthropic",
+                    "api_key_env": "ANTHROPIC_API_KEY",
+                    "max_tokens": 8192,
+                    "cost_per_token": 6.0e-06,
+                    "priority": 2,
+                    "capabilities": ["writing", "creative", "analysis", "reasoning", "general"],
+                },
+                "llama-3.1-70b": {
+                    "provider": "vllm",
+                    "api_key_env": "VLLM_API_KEY",
+                    "max_tokens": 8192,
+                    "cost_per_token": 0.0,
+                    "priority": 1,
+                    "capabilities": ["reasoning", "analysis", "general", "translation"],
+                    "gpu_memory_gb": 160,
+                },
+            },
+            "routing_rules": [
+                {
+                    "name": "code_generation",
+                    "condition": "query_type == 'code_generation'",
+                    "target_model": "gpt-4-turbo",
+                },
+                {
+                    "name": "long_context_analysis",
+                    "condition": "query_type == 'analysis' and context_length > 20000",
+                    "target_model": "claude-3.5-sonnet",
+                },
+                {
+                    "name": "premium_tier",
+                    "condition": "user_tier == 'premium'",
+                    "target_model": "claude-3.5-sonnet",
+                },
+                {
+                    "name": "free_tier",
+                    "condition": "user_tier == 'free'",
+                    "target_model": "mistral-7b",
+                },
+            ],
         })
         config.setdefault("adapters", {
             "enabled": False,
             "registry_path": "data/adapters/registry.json",
+            "selection": {
+                "strategy": "static",
+                "canary": {
+                    "enabled": False,
+                    "stages": [5, 20, 100],
+                },
+            },
+            "training": {
+                "base_model": "mistral-7b",
+                "method": "lora",
+                "learning_rate": 0.0002,
+                "epochs": 3,
+                "batch_size": 8,
+            },
         })
         config.setdefault("optimization", {
             "enabled": False,
@@ -77,12 +152,20 @@ class LLMRouterPlatform:
             "tensorrt": False,
         })
         config.setdefault("quality", {
-            "monitor": {"enabled": False, "window_size": 100},
+            "monitor": {
+                "enabled": False,
+                "window_size": 100,
+                "window_duration_minutes": 60,
+            },
             "slo_targets": {
                 "availability": 0.999,
                 "latency_p95_ms": 2000,
                 "error_rate_max": 0.01,
             },
+            "feedback": {
+                "storage_path": "data/feedback",
+            },
+            "health_check_interval_s": 30,
         })
         config.setdefault("policies", {
             "quota": {
@@ -105,6 +188,11 @@ class LLMRouterPlatform:
                     "premium": 0.10,
                     "enterprise": 1.00,
                 }
+            },
+            "circuit_breaker": {
+                "enabled": True,
+                "failure_threshold": 5,
+                "recovery_timeout_s": 30,
             },
         })
         config.setdefault("router_mode", {

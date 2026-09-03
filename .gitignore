@@ -1,97 +1,46 @@
-# === Python ===
+# --- Python ---
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
-venv/
+.eggs/
+build/
+dist/
 .venv/
-env/
-ENV/
-env.bak/
-venv.bak/
+venv/
 
-# Testing / coverage
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
-coverage.xml
-*.cover
-.hypothesis/
-
-# Type checkers / linters
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.ruff_cache/
-.pytype/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# === Environment / secrets ===
+# --- Env / Secrets ---
 .env
 .env.*
-!.env.example
 *.pem
 *.key
+secrets/
+slack/credentials/
 
-# === Logs / data ===
+# --- Logs and runtime data ---
 logs/
 *.log
-data/
-*.sqlite
-*.sqlite3
-*.db
+*.log.jsonl
+data/queries/
+data/processed/
+data/feedback/
 
-# === Docker ===
-docker/**/volumes/
-docker-compose.override.yml
+# --- Model weights ---
+*.bin
+*.safetensors
+*.pt
+*.gguf
+data/adapters/
 
-# === Kafka ===
-kafka/**/data/
-kafka-logs/
-zookeeper-data/
+# --- Service volumes ---
+clickhouse/data/
+docker/volumes/
 
-# === ClickHouse ===
-clickhouse/**/data/
-clickhouse/**/logs/
-
-# === Flink ===
-flink/**/checkpoints/
-flink/**/savepoints/
-
-# === Streamlit ===
-.streamlit/secrets.toml
-
-# === Editors / OS ===
+# --- IDE ---
 .vscode/
 .idea/
-*.swp
-*.swo
 .DS_Store
-Thumbs.db
 
-# === Claude ===
-.claude/settings.local.json
+# --- Tests / coverage ---
+.pytest_cache/
+.coverage
+htmlcov/

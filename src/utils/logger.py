@@ -7,7 +7,7 @@ import logging.handlers
 import sys
 from pathlib import Path
 
-from pythonjsonlogger.json import JsonFormatter
+# from pythonjsonlogger.json import JsonFormatter
 
 ##### Default Configs #####
 
@@ -77,12 +77,15 @@ def setup_logging(log_level=DEFAULT_LOG_LEVEL,
 
         if structured_logs:
             try:
+                from pythonjsonlogger.json import JsonFormatter      # make sure not fail when main.py setup 
                 json_handler = logging.handlers.RotatingFileHandler(
                     f"{log_file}.jsonl", maxBytes=max_bytes,
                     backupCount=backup_count, encoding="utf-8")
                 json_handler.setLevel(logging.INFO)
                 json_handler.setFormatter(JsonFormatter(json_format))
                 logger.addHandler(json_handler)
+            except ImportError:
+                logger.debug("python-json-logger not installed; skipping JSON log channel")
             except Exception as exc:
                 failures.append(f"structured channel: {exc}")
 

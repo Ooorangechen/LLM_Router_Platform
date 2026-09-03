@@ -5,7 +5,7 @@ import time
 import signal
 import asyncio
 from pathlib import Path
-
+from copy import deepcopy
 import click
 import yaml
 
@@ -13,7 +13,9 @@ from src.llm_router_part0_setup import setup_project_environment
 from src.utils.logger import setup_logging, get_logger
 import src.utils.metrics  
 
-DEFAULT_CONFIG_PATH = "config/config.yaml"
+DEFAULTS_CONFIG_PATH = "config/defaults.yaml"
+CONFIG_PATH = "config/config.yaml"
+
 
 try:
     from prometheus_client import start_http_server
@@ -30,8 +32,9 @@ class LLMRouterPlatform:
         initializeing service structure
     """
 
-    def __init__(self, config_path:str=DEFAULT_CONFIG_PATH):
-        self.config_path = config_path
+    def __init__(self, config_path: str = CONFIG_PATH, defaults_config_path: str = DEFAULTS_CONFIG_PATH,):
+        self.config_path = Path(config_path)
+        self.defaults_config_path = Path(defaults_config_path)
         self.config = self._load_config()
         self.services = {}
         self._setup_logging()
@@ -39,167 +42,56 @@ class LLMRouterPlatform:
 
     def _load_config(self) -> dict:
         """
-        Read from config.yaml,
-        Use default values when missing sections.
+        Load canonical defaults, then recursively apply user overrides.
         """
+        defaults = self._read_yaml_mapping(
+            self.defaults_config_path
+        )
+        overrides = self._read_yaml_mapping(
+            self.config_path
+        )
+
+        return self._deep_merge(defaults, overrides)
+
+    @staticmethod
+    def _read_yaml_mapping(path: Path) -> dict:
         try:
-            with open(self.config_path, "r") as f:
-                config = yaml.safe_load(f) or {}
+            with path.open("r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
         except FileNotFoundError:
-            print(f"Config file not found: {self.config_path}")
+            print(f"Config file not found: {path}")
             sys.exit(1)
-        except yaml.YAMLError as e:
-            print(f"Invalid YAML in config file: {e}")
+        except yaml.YAMLError as exc:
+            print(f"Invalid YAML in config file {path}: {exc}")
             sys.exit(1)
 
-        config.setdefault("api", {
-            "host": "0.0.0.0",
-            "port": 8080,
-            "log_level": "info",
-            "cors_origins": ["*"],
-            "rate_limiting": {
-                "enabled": False,
-                "rpm": 60,
-                "burst_size": 10,
-            },
-        })
-        config.setdefault("router", {
-            "default_model": "mistral-7b",
-            "routing_strategy": "intelligent",
-            "models": {
-                "mistral-7b": {
-                    "provider": "vllm",
-                    "api_key_env": "VLLM_API_KEY",
-                    "max_tokens": 8192,
-                    "cost_per_token": 0.0,
-                    "priority": 1,
-                    "capabilities": ["general", "math"],
-                    "gpu_memory_gb": 16,
-                },
-                "gpt-4-turbo": {
-                    "provider": "openai",
-                    "api_key_env": "OPENAI_API_KEY",
-                    "max_tokens": 4096,
-                    "cost_per_token": 1.5e-05,
-                    "priority": 2,
-                    "capabilities": ["coding", "reasoning", "analysis", "general"],
-                },
-                "claude-3.5-sonnet": {
-                    "provider": "anthropic",
-                    "api_key_env": "ANTHROPIC_API_KEY",
-                    "max_tokens": 8192,
-                    "cost_per_token": 6.0e-06,
-                    "priority": 2,
-                    "capabilities": ["writing", "creative", "analysis", "reasoning", "general"],
-                },
-                "llama-3.1-70b": {
-                    "provider": "vllm",
-                    "api_key_env": "VLLM_API_KEY",
-                    "max_tokens": 8192,
-                    "cost_per_token": 0.0,
-                    "priority": 1,
-                    "capabilities": ["reasoning", "analysis", "general", "translation"],
-                    "gpu_memory_gb": 160,
-                },
-            },
-            "routing_rules": [
-                {
-                    "name": "code_generation",
-                    "condition": "query_type == 'code_generation'",
-                    "target_model": "gpt-4-turbo",
-                },
-                {
-                    "name": "long_context_analysis",
-                    "condition": "query_type == 'analysis' and context_length > 20000",
-                    "target_model": "claude-3.5-sonnet",
-                },
-                {
-                    "name": "premium_tier",
-                    "condition": "user_tier == 'premium'",
-                    "target_model": "claude-3.5-sonnet",
-                },
-                {
-                    "name": "free_tier",
-                    "condition": "user_tier == 'free'",
-                    "target_model": "mistral-7b",
-                },
-            ],
-        })
-        config.setdefault("adapters", {
-            "enabled": False,
-            "registry_path": "data/adapters/registry.json",
-            "selection": {
-                "strategy": "static",
-                "canary": {
-                    "enabled": False,
-                    "stages": [5, 20, 100],
-                },
-            },
-            "training": {
-                "base_model": "mistral-7b",
-                "method": "lora",
-                "learning_rate": 0.0002,
-                "epochs": 3,
-                "batch_size": 8,
-            },
-        })
-        config.setdefault("optimization", {
-            "enabled": False,
-            "kv_cache_size_gb": 8,
-            "max_batch_size": 32,
-            "max_wait_ms": 100,
-            "flash_attn": True,
-            "tensorrt": False,
-        })
-        config.setdefault("quality", {
-            "monitor": {
-                "enabled": False,
-                "window_size": 100,
-                "window_duration_minutes": 60,
-            },
-            "slo_targets": {
-                "availability": 0.999,
-                "latency_p95_ms": 2000,
-                "error_rate_max": 0.01,
-            },
-            "feedback": {
-                "storage_path": "data/feedback",
-            },
-            "health_check_interval_s": 30,
-        })
-        config.setdefault("policies", {
-            "quota": {
-                "tier_quotas": {
-                    "free": {"daily": 100, "hourly": 10},
-                    "premium": {"daily": 1000, "hourly": 100},
-                    "enterprise": {"daily": 10000, "hourly": 1000},
-                }
-            },
-            "sla": {
-                "latency_slas": {
-                    "free": "10s",
-                    "premium": "5s",
-                    "enterprise": "2s",
-                }
-            },
-            "budget": {
-                "cost_budgets": {
-                    "free": 0.01,
-                    "premium": 0.10,
-                    "enterprise": 1.00,
-                }
-            },
-            "circuit_breaker": {
-                "enabled": True,
-                "failure_threshold": 5,
-                "recovery_timeout_s": 30,
-            },
-        })
-        config.setdefault("router_mode", {
-            "use_integrated_router": False,
-        })
+        if data is None:
+            data = {}
 
-        return config
+        if not isinstance(data, dict):
+            print(f"Config file must contain a YAML mapping: {path}")
+            sys.exit(1)
+
+        return data
+
+    @staticmethod
+    def _deep_merge(defaults: dict, overrides: dict) -> dict:
+        result = deepcopy(defaults)
+
+        for key, override_value in overrides.items():
+            default_value = result.get(key)
+
+            if isinstance(default_value, dict) and isinstance(
+                override_value, dict
+            ):
+                result[key] = LLMRouterPlatform._deep_merge(
+                    default_value,
+                    override_value,
+                )
+            else:
+                result[key] = deepcopy(override_value)
+
+        return result
 
     def _setup_logging(self):
         log_cfg = self.config.get("logging", {})
@@ -360,7 +252,7 @@ app = None
 
 if os.getenv("LLM_ROUTER_DEV_MODE") == "true":
     _dev_platform = LLMRouterPlatform(
-        config_path=os.getenv("LLM_ROUTER_CONFIG", DEFAULT_CONFIG_PATH)
+        config_path=os.getenv("LLM_ROUTER_CONFIG", CONFIG_PATH)
     )
     app = _dev_platform._create_fastapi_app()
 
@@ -384,7 +276,7 @@ def setup():
 
 
 @cli.command()
-@click.option("--config", "config_path", default=DEFAULT_CONFIG_PATH,
+@click.option("--config", "config_path", default=CONFIG_PATH,
               show_default=True, help="Config path")
 @click.option("--dev", is_flag=True, default=False,
               help="Dev: auto restart after code changes")

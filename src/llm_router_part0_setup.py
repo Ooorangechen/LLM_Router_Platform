@@ -48,13 +48,17 @@ REQUIRED_DIRS = [
 # python package directories that additionally need an empty __init__.py
 PACKAGE_DIRS = ["src", "src/models", "src/utils", "tests"]
 
+DEFAULTS_CONFIG_REL_PATH = "config/defaults.yaml"
 CONFIG_REL_PATH = "config/config.yaml"
 
 # 3.1.4 key files that must exist once setup finishes
-KEY_FILES = [CONFIG_REL_PATH, "requirements.txt"]
+KEY_FILES = [
+    DEFAULTS_CONFIG_REL_PATH,
+    CONFIG_REL_PATH,
+    "requirements.txt",
+]
 
-# 3.1.4 sections looked for inside config.yaml, missing ones are only reported
-# because main.py injects defaults for them at load time
+# 3.1.4 sections required in both generated configuration files
 EXPECTED_SECTIONS = ["api", "router", "inference", "kafka", "monitoring"]
 
 
@@ -124,8 +128,8 @@ mypy>=1.7
 
 
 CONFIG_TEMPLATE = """\
-## 全平台配置文件，按section分层
-## api / logging / router / ...
+# One-truth-source, default configs
+# has the complete default structure
 api:
   host: "0.0.0.0"
   port: 8080
@@ -155,28 +159,31 @@ router:
       provider: vllm
       api_key_env: VLLM_API_KEY
       max_tokens: 8192
-      cost_per_token: 0.0
+      cost_input_token: 0.0
+      cost_output_token: 0.0
       priority: 1
       capabilities:
         - general
         - math
       gpu_memory_gb: 16
-    gpt-4-turbo:
+    gpt-5.6-terra:
       provider: openai
       api_key_env: OPENAI_API_KEY
-      max_tokens: 4096
-      cost_per_token: 1.5e-05
+      max_tokens: 8192
+      cost_input_token: 2.0e-06
+      cost_output_token: 1.2e-05
       priority: 2
       capabilities:
         - coding
         - reasoning
         - analysis
         - general
-    claude-3.5-sonnet:
+    claude-5-sonnet:
       provider: anthropic
       api_key_env: ANTHROPIC_API_KEY
       max_tokens: 8192
-      cost_per_token: 6.0e-06
+      cost_input_token: 2.0e-06
+      cost_output_token: 1.0e-05
       priority: 2
       capabilities:
         - writing
@@ -188,7 +195,8 @@ router:
       provider: vllm
       api_key_env: VLLM_API_KEY
       max_tokens: 8192
-      cost_per_token: 0.0
+      cost_input_token: 0.0
+      cost_output_token: 0.0
       priority: 1
       capabilities:
         - reasoning
@@ -517,11 +525,12 @@ class ProjectSetup:
     # ---------------------------------------------------------------- entry
 
     def setup_project_environment(self, install_deps: bool = True) -> None:
-        """Scaffold entry point: directories -> templates -> config -> venv -> validation."""
+        """Scaffold entry point: directories -> templates -> configs -> venv -> validation."""
         self.logger.info(f"Starting project environment setup at {self.project_root}")
 
         self._create_directories()
         self._create_files()
+        self._create_defaults_config_file()
         self._create_config_file()
 
         if install_deps:
@@ -573,9 +582,15 @@ class ProjectSetup:
 
     # --------------------------------------------------------- 3. config
 
+    def _create_defaults_config_file(self) -> None:
+        """Regenerate defaults.yaml from the canonical setup template every time."""
+        defaults_path = self.project_root / DEFAULTS_CONFIG_REL_PATH
+        defaults_path.parent.mkdir(parents=True, exist_ok=True)
+        defaults_path.write_text(self._template_config_yaml(), encoding="utf-8")
+        self.logger.info(f"Default config generated: {DEFAULTS_CONFIG_REL_PATH}")
+
     def _create_config_file(self) -> None:
-        """config.yaml is not one of the 10 templates but 5.2 still expects it to exist
-        after a clean setup, and 3.1.4 validates it right afterwards."""
+        """Initialize config.yaml from the same template without overwriting user edits."""
         config_path = self.project_root / CONFIG_REL_PATH
 
         if config_path.exists():
@@ -634,24 +649,23 @@ class ProjectSetup:
         self.logger.info("Directory and key file validation passed")
 
     def _validate_config(self) -> None:
-        config_path = self.project_root / CONFIG_REL_PATH
+        for rel_path in (DEFAULTS_CONFIG_REL_PATH, CONFIG_REL_PATH):
+            config_path = self.project_root / rel_path
 
-        try:
-            with config_path.open("r", encoding="utf-8") as f:
-                config = yaml.safe_load(f) or {}
-        except yaml.YAMLError as exc:
-            raise ValueError(f"config.yaml is not valid YAML: {exc}") from exc
+            try:
+                with config_path.open("r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f) or {}
+            except yaml.YAMLError as exc:
+                raise ValueError(f"{rel_path} is not valid YAML: {exc}") from exc
 
-        # 3.1.4 only the YAML syntax is a hard requirement here, a missing section is
-        # reported but not fatal because main.py._load_config injects defaults for it
-        missing = [name for name in EXPECTED_SECTIONS if name not in config]
-        if missing:
-            self.logger.warning(
-                f"config.yaml is missing sections {missing}, "
-                f"main.py will inject defaults at load time"
-            )
+            if not isinstance(config, dict):
+                raise ValueError(f"{rel_path} must contain a top-level YAML mapping")
 
-        self.logger.info("config.yaml structure validation passed")
+            missing = [name for name in EXPECTED_SECTIONS if name not in config]
+            if missing:
+                raise ValueError(f"{rel_path} is missing required sections: {missing}")
+
+            self.logger.info(f"Configuration structure validation passed: {rel_path}")
 
     # ------------------------------------------------------- templates
 
@@ -1070,5 +1084,6 @@ if __name__ == "__main__":
     for name in setup.required_files:
         print(f"  {name}")
 
-    print(f"config template: {CONFIG_REL_PATH}")
+    print(f"default config template: {DEFAULTS_CONFIG_REL_PATH}")
+    print(f"user config template: {CONFIG_REL_PATH}")
     print("Dry run only, call setup_project_environment() to apply.")

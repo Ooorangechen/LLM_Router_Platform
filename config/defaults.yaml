@@ -1,5 +1,5 @@
-## 全平台配置文件，按section分层
-## api / logging / router / ...
+# One-truth-source, default configs
+# has the complete default structure
 api:
   host: "0.0.0.0"
   port: 8080

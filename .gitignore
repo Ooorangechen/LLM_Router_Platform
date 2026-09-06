@@ -44,6 +44,3 @@ docker/volumes/
 .pytest_cache/
 .coverage
 htmlcov/
-
-
-docs/materials/

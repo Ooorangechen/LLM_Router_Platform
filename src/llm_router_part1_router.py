@@ -1,7 +1,7 @@
 import re
 from src.utils.logger import get_logger
 from src.utils.schema import QueryType
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any, Optional, Callable
 
 logger = get_logger(__name__)
 
@@ -10,7 +10,14 @@ KEYWORD_WEIGHT= 0.4
 CONFIDENCE_THRESHOLD = 0.1  
 FALLBACK_CONFIDENCE = 0.5
 
+_FALLBACK_TOKENS_PER_WORD = 1.3
 _TOKEN_RE = re.compile(r"[a-z0-9_+#]+")
+
+HF_TOKENIZER_REPOS: Dict[str, str] = {
+    "llama": "unsloth/Meta-Llama-3.1-70B-Instruct",
+    "mistral": "mistralai/Mistral-7B-Instruct-v0.3",
+}
+
 
 class QueryClassifier:
     """
@@ -25,128 +32,125 @@ class QueryClassifier:
     def _init_patterns(self) -> Dict[QueryType, List[str]]:
         return {
             QueryType.TRANSLATION: [
-                r"\b(translat\w+|localiz\w+)\b|翻译|译成|译文",
-                r"\b(into|to|from)\s+(english|chinese|spanish|french|german|japanese|korean|russian)\b"
-                r"|(翻译成|译为).{0,6}(英|中|日|法|德|西|韩|俄)",
-                r"\bin\s+(english|chinese|japanese|french|german|spanish)\b|用(英文|中文|日语|法语)(说|表达)",
-                r"\bwhat does .{0,30} mean in\b|的(英文|中文|日文)是什么",
+                r"\b(translat\w+|localiz\w+)\b",
+                r"\b(into|to|from)\s+(english|chinese|spanish|french|german|japanese|korean|russian)\b",
+                r"\bin\s+(english|chinese|japanese|french|german|spanish)\b",
+                r"\bwhat does .{0,30} mean in\b",
             ],
             QueryType.MATH: [
-                r"\b(calculat|comput|solv|deriv|integrat|differentiat)\w*\b|计算|求解|求导|积分",
-                r"\b(equation|formula|theorem|proof|matrix|vector|probability|derivative|integral)\b"
-                r"|方程|公式|定理|证明|矩阵|向量|概率|导数",
-                r"\d+\s*[\+\-\*/\^=]\s*\d+|\b(sum|product|average|mean|median|percentage)\b|求和|平均值|百分比",
-                r"\b(algebra|calculus|geometry|statistic|arithmetic)\w*\b|代数|微积分|几何|统计学|算术",
+                r"\b(calculat|comput|solv|deriv|integrat|differentiat)\w*\b",
+                r"\b(equation|formula|theorem|proof|matrix|vector|probability|derivative|integral)\b",
+                r"\d+\s*[\+\-\*/\^=]\s*\d+|\b(sum|product|average|mean|median|percentage)\b",
+                r"\b(algebra|calculus|geometry|statistic|arithmetic)\w*\b",
             ],
             QueryType.CODE_ANALYSIS: [
-                r"\b(debug|fix|repair|troubleshoot)\w*\b|修复|调试|排查",
-                r"\b(bug|error|exception|traceback|stack ?trace|crash|fail(ing|ed)?)\b|报错|异常|崩溃",
-                r"\b(optimiz|refactor|performance|complexity)\w*\b|memory leak|优化|重构|复杂度|内存泄漏",
-                r"\b(review|explain|analyz\w+)\b.{0,15}\b(code|function|snippet)\b|(看看|检查|分析).{0,8}(代码|函数)",
+                r"\b(debug|fix|repair|troubleshoot)\w*\b",
+                r"\b(bug|error|exception|traceback|stack ?trace|crash|fail(ing|ed)?)\b",
+                r"\b(optimiz|refactor|performance|complexity)\w*\b|memory leak",
+                r"\b(review|explain|analyz\w+)\b.{0,15}\b(code|function|snippet)\b",
             ],
             QueryType.CODE_GENERATION: [
                 r"\b(write|generate|create|implement|build)\b.{0,15}"
-                r"\b(code|function|class|script|program|api|endpoint)\b"
-                r"|(写|实现|生成|编写).{0,10}(代码|函数|类|脚本|程序|接口)",
+                r"\b(code|function|class|script|program|api|endpoint)\b",
                 r"\b(def|class|import|function|const|async|await|return)\b",
                 r"\b(python|java|javascript|typescript|c\+\+|golang|rust|sql|bash|react|html|css)\b",
-                r"\bhow (do|to|can) i (write|code|implement|build)\b|怎么(写|实现|编写|做一个)",
+                r"\bhow (do|to|can) i (write|code|implement|build)\b",
             ],
             QueryType.SUMMARIZATION: [
-                r"\b(summar\w+|tldr|tl;dr|recap|condense)\b|总结|概括|摘要|归纳",
-                r"\bkey (points?|takeaways?|findings?)\b|要点|重点|核心内容",
-                r"\b(in (short|brief)|briefly|shorten)\b|简要|简述|一句话",
-                r"\b(extract|pull out)\b.{0,15}\b(main|key|important)\b|(提炼|提取).{0,8}(要点|信息)",
+                r"\b(summar\w+|tldr|tl;dr|recap|condense)\b",
+                r"\bkey (points?|takeaways?|findings?)\b",
+                r"\b(in (short|brief)|briefly|shorten)\b",
+                r"\b(extract|pull out)\b.{0,15}\b(main|key|important)\b",
             ],
             QueryType.CREATIVE_WRITING: [
                 r"\b(write|compose|draft|create)\b.{0,15}"
-                r"\b(story|poem|novel|song|lyric|script|essay|article|blog)\b"
-                r"|(写|创作|来一[篇个段]).{0,15}(故事|小说|诗|诗歌|歌词|剧本|散文)",
-                r"\b(creative|fiction|narrative|character|plot|dialogue)\b|创意|虚构|情节|人物|对白",
-                r"\b(imagine|pretend|role.?play|as if you were)\b|想象|假设你是|扮演",
-                r"\bin the style of\b|模仿.{0,6}(风格|文风)",
+                r"\b(story|poem|novel|song|lyric|script|essay|article|blog)\b",
+                r"\b(creative|fiction|narrative|character|plot|dialogue)\b",
+                r"\b(imagine|pretend|role.?play|as if you were)\b",
+                r"\bin the style of\b",
             ],
             QueryType.BRAINSTORMING: [
-                r"\b(brainstorm|ideate)\w*\b|头脑风暴|发散",
+                r"\b(brainstorm|ideate)\w*\b",
                 r"\b(give|list|generate|suggest)\b.{0,20}"
-                r"\b(ideas?|options?|alternatives?|ways?|suggestions?)\b"
-                r"|(给|列|想|来).{0,15}(想法|点子|主意|方案|建议)",
-                r"\b(what else|any other|other possibilities)\b|还有(什么|哪些)|其他(方案|可能)",
-                r"\b\d{1,2}\s+(ideas?|ways?|options?|tips?)\b|\d{1,2}\s*个\s*(点子|想法|方法|建议)",
+                r"\b(ideas?|options?|alternatives?|ways?|suggestions?)\b",
+                r"\b(what else|any other|other possibilities)\b",
+                r"\b\d{1,2}\s+(ideas?|ways?|options?|tips?)\b",
             ],
             QueryType.PLANNING: [
-                r"\b(plan|roadmap|schedule|timeline|milestone|agenda)\b|计划|规划|路线图|时间表|里程碑|日程",
-                r"\bstep.by.step\b|\bsteps? to\b|\bhow (do|to) i (start|begin|approach)\b|步骤|分步|怎么(开始|着手)",
-                r"\b(strategy|strategic|prioriti\w+|allocate)\b|策略|战略|优先级|排期",
-                r"\b(organiz|arrang|prepar)\w*\b.{0,20}\b(project|event|trip|sprint)\b|(安排|筹备).{0,8}(项目|活动|行程)",
+                r"\b(plan|roadmap|schedule|timeline|milestone|agenda)\b",
+                r"\bstep.by.step\b|\bsteps? to\b|\bhow (do|to) i (start|begin|approach)\b",
+                r"\b(strategy|strategic|prioriti\w+|allocate)\b",
+                r"\b(organiz|arrang|prepar)\w*\b.{0,20}\b(project|event|trip|sprint)\b",
             ],
             QueryType.ANALYSIS: [
-                r"\b(analyz|analys|evaluat|assess|examin)\w*\b|分析|评估|考察",
-                r"\b(compare|contrast|difference|versus|vs\.?|pros and cons)\b|对比|比较|区别|优缺点",
-                r"\b(trend|pattern|insight|correlation|breakdown)\b|趋势|规律|洞察|相关性",
-                r"\bwhat (are|is) the (impact|effect|implication)\w*\b|有什么(影响|意义)",
+                r"\b(analyz|analys|evaluat|assess|examin)\w*\b",
+                r"\b(compare|contrast|difference|versus|vs\.?|pros and cons)\b",
+                r"\b(trend|pattern|insight|correlation|breakdown)\b",
+                r"\bwhat (are|is) the (impact|effect|implication)\w*\b",
             ],
             QueryType.REASONING: [
-                r"\b(why|rationale|justif\w+)\b|为什么|为何|原因是|理由",
-                r"\b(infer|deduce|conclude|imply|therefore)\b|推理|推导|推断|因此",
-                r"\bif\b.{0,30}\bthen\b|\b(suppose|assume|hypothetical|what if)\b|如果.{0,20}(那么|会怎样)|假如|假设",
-                r"\b(logic|logical|fallacy|argument|premise|conclusion)\b|逻辑|谬误|论点|前提|结论",
+                r"\b(why|rationale|justif\w+)\b",
+                r"\b(infer|deduce|conclude|imply|therefore)\b",
+                r"\bif\b.{0,30}\bthen\b|\b(suppose|assume|hypothetical|what if)\b",
+                r"\b(logic|logical|fallacy|argument|premise|conclusion)\b",
             ],
             QueryType.QUESTION_ANSWERING: [
-                r"^\s*(what|who|when|where|which|how much|how many)\b|^\s*(什么|谁|何时|哪里|哪个|多少)",
-                r"\b(what (is|are|does|do)|who (is|was)|when (did|was)|where (is|can))\b|是什么|是谁|在哪",
-                r"\b(tell me about|do you know|can you tell)\b|告诉我|你知道.{0,10}吗",
-                r"\b(definition|meaning|means|stands for)\b|定义|含义|意思是",
+                r"^\s*(what|who|when|where|which|how much|how many)\b",
+                r"\b(what (is|are|does|do)|who (is|was)|when (did|was)|where (is|can))\b",
+                r"\b(tell me about|do you know|can you tell)\b",
+                r"\b(definition|meaning|means|stands for)\b",
             ],
         }
 
-
     def _init_keywords(self) -> Dict[QueryType, List[str]]:
-
         return {
             QueryType.TRANSLATION: [
-                "translate", "translation", "chinese", 'english',
-                "翻译", "中文", "意思", '英文'
+                "translate", "translation", "english",
+                "chinese", "spanish", "japanese",
             ],
             QueryType.MATH: [
-                "calculate", "equation", "derivative", "probability", 
-                "计算", "概率", '运算'
+                "calculate", "equation", "derivative",
+                "probability", "integral", "determinant",
             ],
             QueryType.CODE_ANALYSIS: [
-                "bug", "debug", "crash", "refactor",
-                "报错", "异常", '修复'
+                # 不放 fix / error：两者都已在 patterns 里，且 error 会误伤普通英文
+                "bug", "debug", "crash",
+                "refactor", "traceback", "segfault",
             ],
             QueryType.CODE_GENERATION: [
-                "function", "script", "endpoint", "rest", 'c++',
-                "函数", "脚本", "实现",
+                "function", "script", "endpoint",
+                "rest", "api", "python",
             ],
             QueryType.SUMMARIZATION: [
-                "summarize", "tldr", 'summary',
-                "总结", "摘要", "压缩", "纪要",
+                "summarize", "summary", "tldr",
+                "recap", "condense", "shorten",
             ],
             QueryType.CREATIVE_WRITING: [
-                "story", "poem", "novel", "fiction",
-                "故事", "小说", "主角",
+                "story", "poem", "novel",
+                "fiction", "protagonist", "lyric",
             ],
             QueryType.BRAINSTORMING: [
-                "brainstorm", "idea", "alternative", "option",
-                "点子", "发散", "方案",
+                "brainstorm", "idea", "alternative",
+                "option", "suggestion", "possible",
             ],
             QueryType.PLANNING: [
-                "roadmap", "schedule", "timeline", 'plan',
-                "计划", "规划", "排期", "着手",
+                "roadmap", "schedule", "timeline",
+                "milestone", "sprint", "agenda",
             ],
             QueryType.ANALYSIS: [
-                "analyze", "analysis", "compare", "evaluate", "trend",
-                "分析", "评估",
+                "analyze", "analysis", "compare",
+                "evaluate", "trend", "correlation",
             ],
             QueryType.REASONING: [
-                "rationale", "infer", "premise", 
-                "为什么", "假如", "怎样",
+                # 不放 why：它在 patterns 第 1 条里，重复放会和 CODE_ANALYSIS 抢
+                # "why does this loop run so slowly" 这类查询
+                "rationale", "infer", "premise",
+                "deduce", "fallacy", "hypothesis",
             ],
             QueryType.QUESTION_ANSWERING: [
-                "definition", "meaning", "about", 'explain',
-                "是什么", "定义", "谁",
+                # 刻意不放 what / who / when / where —— 见上面原则 1
+                "definition", "meaning", "about",
+                "explain", "fact", "overview",
             ],
         }
 
@@ -164,7 +168,6 @@ class QueryClassifier:
     def _keyword_classification(self, query: str) -> Dict[QueryType, float]:
         """ 
         score = hits / total keywords count
-
         """
         text = query.lower()
         tokens = set(_TOKEN_RE.findall(text))
@@ -222,3 +225,73 @@ class QueryClassifier:
             return best_type, min(best_score, 1.0)
 
         return QueryType.GENERAL, FALLBACK_CONFIDENCE
+
+class TokenCounter:
+    def __init__(self) -> None:
+        self.endoders: Dict[str, Any] = {}
+        self.encoder_names: Dict[str, str] = {}
+        self._initialize_encoders()
+
+    def _initialize_encoders(self):
+        cl100k_counter: Optional[Callable[[str], int]] = None
+        try:
+            import tiktoken
+            o200k_enc = tiktoken.get_encoding("o200k_base")
+            cl100k_enc = tiktoken.get_encoding("cl100k_base")
+            cl100k_counter = lambda t: len(cl100k_enc.encode(t))
+            o200k_counter = lambda t: len(o200k_enc.encode(t))
+
+            self.encoders["gpt"] = o200k_counter
+            self.encoders["claude"] = cl100k_counter
+            self.encoders["default"] = cl100k_counter
+            self.encoder_names.update(
+                {"gpt": "o200k_base", "claude": "cl100k_base", "default": "cl100k_base"}
+            )
+
+        except Exception as e:
+            logger.warning(
+                f"tiktoken unavailable, gpt/claude/default will use "
+                f"word-count approximation: {type(e).__name__}: {e}")
+
+        for key, repo in HF_TOKENIZER_REPOS.items():
+            try:
+                from transformers import AutoTokenizer
+                tok = AutoTokenizer.from_pretrained(repo)
+                self.encoders[key] = (
+                    lambda t, _tok=tok: len(_tok.encode(t, add_special_tokens=False))
+                )
+                self.encoder_names[key] = f"{repo} (vocab={tok.vocab_size})"
+            except Exception as e:
+                if cl100k_counter is not None:
+                    self.encoders[key] = cl100k_counter
+                    self.encoder_names[key] = "cl100k_base (fallback)"
+                logger.warning(
+                    f"Failed to load HF tokenizer '{repo}' for key '{key}', "
+                    f"falling back to cl100k_base: {type(e).__name__}: {e}"
+                )
+        logger.info(f"Token encoders initialized: {self.encoder_names}")
+
+    def _get_encoder_key(self, model:str) -> str:
+        model_lower = (model or "").lower()
+        if "gpt" in model_lower:
+            return "gpt"
+        if "claude" in model_lower:
+            return "claude"
+        if "llama" in model_lower:
+            return "llama"
+        if "mistral" in model_lower or "mixtral" in model_lower:
+            return "mistral"
+        return "default"
+        
+    def count_toknes(self, text: str, model: str ="default") -> int:
+        if not text:
+            return 0
+        try:
+            return self.encoders[self._get_encoder_key(model)](text)
+        except Exception as e:
+            logger.warning(
+                f"Token counting failed for model='{model}', "
+                f"falling back to word-count approximation: {type(e).__name__}: {e}"
+            )
+            return int(len(text.split()) * _FALLBACK_TOKENS_PER_WORD)
+

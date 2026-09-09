@@ -1,6 +1,12 @@
 import re
+import random
+import math
+from copy import deepcopy
+from time import perf_counter
+from dataclasses import dataclass
 from src.utils.logger import get_logger
-from src.utils.schema import QueryType
+from src.utils.metrics import ROUTER_METRICS
+from src.utils.schema import ModelConfig, QueryRequest, QueryType, RoutingDecision
 from typing import Dict, List, Tuple, Any, Optional, Callable
 
 logger = get_logger(__name__)
@@ -32,6 +38,46 @@ TOKENIZER_FAMILIES: Dict[str, Dict[str, str]] = {
         "name": "mistralai/Mistral-7B-Instruct-v0.3",
     },
 }
+
+
+@dataclass
+class RoutingRule:
+    """Internal routing rule loaded from the router configuration."""
+
+    name: str
+    condition: str
+    models: List[str]
+    fallback: str
+    weight: float = 1.0
+
+    def matches(self, query_context: Dict[str, Any]) -> bool:
+        # P2 conditions come from trusted operator configuration. Disabling
+        # builtins does not make eval a sandbox for user-supplied expressions.
+        try:
+            return bool(
+                eval(
+                    self.condition,
+                    {"__builtins__": {}},
+                    query_context,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Routing rule '%s' evaluation failed: %s: %s",
+                self.name,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+
+
+@dataclass
+class ModelCandidate:
+    """Internal model-selection result used to build RoutingDecision."""
+
+    model_name: str
+    confidence: float
+    reason: str
 
 
 class QueryClassifier:
@@ -147,7 +193,7 @@ class QueryClassifier:
             QueryType.CODE_GENERATION: [
                 r"(写|编写|生成|创建|实现|开发).{0,15}(代码|函数|类|脚本|程序|接口|服务)",
                 r"(使用|用).{0,10}"
-                r"(Python|Java|JavaScript|TypeScript|C\+\+|Go|Rust|SQL)"
+                r"(python|java|javascript|typescript|c\+\+|go|rust|sql)"
                 r".{0,15}(写|实现|开发)",
                 r"(定义|实现).{0,10}(函数|类|接口|算法|数据结构)",
                 r"(帮我|请).{0,6}(写|实现|生成).{0,15}(代码|程序|函数)",
@@ -399,35 +445,30 @@ class TokenCounter:
     def _initialize_encoders(self) -> None:
         default_counter: Optional[Callable[[str], int]] = None
 
-        try:
-            import tiktoken
+        tiktoken_names = {"default": "cl100k_base"}
+        tiktoken_names.update({
+            family: spec["name"] for family, spec in TOKENIZER_FAMILIES.items()
+            if spec["backend"] == "tiktoken"
+        })
+        for family, encoding_name in tiktoken_names.items():
+            try:
+                import tiktoken
 
-            default_encoder = tiktoken.get_encoding("cl100k_base")
-            default_counter = lambda text: len(
-                default_encoder.encode(text, disallowed_special=())
-            )
-            self.encoders["default"] = default_counter
-            self.encoder_names["default"] = "tiktoken:cl100k_base"
-
-            for family, spec in TOKENIZER_FAMILIES.items():
-                if spec["backend"] != "tiktoken":
-                    continue
-
-                encoder = tiktoken.get_encoding(spec["name"])
+                encoder = tiktoken.get_encoding(encoding_name)
                 self.encoders[family] = (
                     lambda text, _encoder=encoder: len(
                         _encoder.encode(text, disallowed_special=())
                     )
                 )
-                self.encoder_names[family] = f"tiktoken:{spec['name']}"
-
-        except Exception as exc:
-            logger.warning(
-                "tiktoken initialization failed; affected model families will "
-                "use word-count approximation: %s: %s",
-                type(exc).__name__,
-                exc,
-            )
+                self.encoder_names[family] = f"tiktoken:{encoding_name}"
+                if family == "default":
+                    default_counter = self.encoders[family]
+            except Exception as exc:
+                logger.warning(
+                    "tiktoken initialization failed for family '%s'; using "
+                    "word-count approximation: %s: %s",
+                    family, type(exc).__name__, exc,
+                )
 
         for family, spec in TOKENIZER_FAMILIES.items():
             if spec["backend"] != "huggingface":
@@ -494,3 +535,405 @@ class TokenCounter:
                 exc,
             )
             return max(0, round(len(text.split()) * _FALLBACK_TOKENS_PER_WORD))
+
+
+class ModelRouter:
+    """Route a validated QueryRequest to one configured model."""
+
+    VALID_ROUTING_STRATEGIES = {
+        "intelligent",
+        "round_robin",
+        "weighted",
+        "fallback",
+    }
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config = deepcopy(config)
+        self.models: Dict[str, ModelConfig] = {}
+        self.routing_rules: List[RoutingRule] = []
+        self.classifier = QueryClassifier()
+        self.token_counter = TokenCounter()
+        self.default_model = str(config.get("default_model") or "mistral-7b")
+        self.routing_strategy = str(
+            config.get("routing_strategy", "intelligent")
+        )
+        self.model_stats: Dict[str, Dict[str, Any]] = {}
+        self._request_count = 0
+        self._is_initialized = False
+
+    async def initialize(self) -> None:
+        """Load configuration-backed state and initialize dependencies."""
+        if self._is_initialized:
+            return
+        self._load_models()
+        self._load_routing_rules()
+
+        if not self.models:
+            raise ValueError("router.models must contain at least one model")
+        if self.default_model not in self.models:
+            raise ValueError(
+                f"Default model '{self.default_model}' is not configured"
+            )
+        if self.routing_strategy not in self.VALID_ROUTING_STRATEGIES:
+            raise ValueError(
+                f"Unsupported routing strategy: {self.routing_strategy}"
+            )
+
+        try:
+            await self.classifier.initialize()
+        except Exception as exc:
+            logger.warning("Classifier initialization failed: %s", exc)
+        self._is_initialized = True
+        logger.info(
+            "ModelRouter initialized with %d models, %d rules, strategy='%s'",
+            len(self.models),
+            len(self.routing_rules),
+            self.routing_strategy,
+        )
+
+    def _load_models(self) -> None:
+        """Validate router.models and initialize per-model statistics."""
+        self.models.clear()
+        self.model_stats.clear()
+
+        for model_name, model_data in self.config.get("models", {}).items():
+            model_config = ModelConfig(name=model_name, **model_data)
+            self.models[model_name] = model_config
+            self.model_stats[model_name] = {
+                "total_requests": 0,
+                "successful_requests": 0,
+                "total_latency": 0.0,
+                "success_rate": 1.0,
+                "avg_latency": 0.0,
+            }
+
+    def _load_routing_rules(self) -> None:
+        """Build internal RoutingRule objects from YAML rule mappings."""
+        self.routing_rules.clear()
+
+        for rule_data in self.config.get("routing_rules", []):
+            self.routing_rules.append(
+                RoutingRule(
+                    name=rule_data["name"],
+                    condition=rule_data["condition"],
+                    models=list(rule_data["models"]),
+                    fallback=rule_data["fallback"],
+                )
+            )
+
+    async def route_query(self, request: QueryRequest) -> RoutingDecision:
+        """Execute the P2 routing pipeline.
+
+        Implementation order:
+        1. Build the query context and model-dependent token counts.
+        2. Establish the user-access and token-limit eligible model pool.
+        3. Dispatch to the configured routing strategy.
+        4. Estimate input/output cost for the selected candidate.
+        5. Build RoutingDecision and record router metrics.
+        6. On any error, build a default-model fallback RoutingDecision.
+        """
+        start = perf_counter()
+        context: Dict[str, Any] = {}
+        try:
+            if not self._is_initialized:
+                raise RuntimeError("Call await router.initialize() before routing")
+            context = await self._build_query_context(request)
+            context["available_models"] = self._get_available_models(context)
+            if self.routing_strategy == "intelligent":
+                selection = await self._intelligent_routing(context)
+            elif self.routing_strategy == "round_robin":
+                selection = self._round_robin_routing(context)
+            elif self.routing_strategy == "weighted":
+                selection = self._weighted_routing(context)
+            elif self.routing_strategy == "fallback":
+                selection = self._fallback_routing(context)
+            else:
+                raise ValueError(f"Unknown strategy: {self.routing_strategy}")
+
+            decision = RoutingDecision(
+                selected_model=selection.model_name,
+                query_type=QueryType(context["query_type"]),
+                token_count=context["token_counts"][selection.model_name],
+                estimated_cost=self._estimate_cost(selection, context),
+                routing_reason=selection.reason,
+                routing_time_ms=int((perf_counter() - start) * 1000),
+                confidence=selection.confidence,
+                fallback_models=[
+                    name for name in context["available_models"]
+                    if name != selection.model_name
+                ],
+                routing_strategy=self.routing_strategy,
+                user_tier=request.user_tier,
+            )
+        except Exception as exc:
+            logger.warning("Routing failed; selecting default model: %s", exc)
+            decision = RoutingDecision(
+                selected_model=self.default_model,
+                query_type=QueryType.GENERAL,
+                token_count=context.get("token_counts", {}).get(self.default_model, 0),
+                estimated_cost=0.0,
+                routing_reason=f"Fallback due to error: {exc}",
+                routing_time_ms=int((perf_counter() - start) * 1000),
+                confidence=0.0,
+                routing_strategy="fallback",
+                user_tier=request.user_tier,
+            )
+
+        # Observability failures must never discard a completed decision.
+        try:
+            ROUTER_METRICS.routing_decisions.labels(
+                model=decision.selected_model, query_type=decision.query_type.value
+            ).inc()
+            ROUTER_METRICS.routing_duration.observe(perf_counter() - start)
+            ROUTER_METRICS.routing_confidence.labels(
+                model=decision.selected_model, query_type=decision.query_type.value
+            ).observe(decision.confidence)
+        except Exception as exc:
+            logger.warning("Router metrics update failed: %s", exc)
+        return decision
+
+    async def _build_query_context(
+        self,
+        request: QueryRequest,
+    ) -> Dict[str, Any]:
+        """Count query + context once per family, with a count per model.
+
+        There is no universal token_count here. Rule evaluation supplies that
+        scalar from token_counts for the particular model being considered.
+        Counts cover raw text, not provider-specific message framing or tools.
+        """
+        try:
+            query_type, confidence = self.classifier.classify_query(request.query)
+        except Exception as exc:
+            logger.warning("Classification failed: %s", exc)
+            query_type, confidence = QueryType.GENERAL, 0.0
+        prompt = "\n\n".join(part for part in (request.context, request.query) if part)
+        counts_by_family: Dict[str, int] = {}
+        token_counts: Dict[str, int] = {}
+        for name in self.models:
+            family = self.token_counter._get_encoder_key(name)
+            if family not in counts_by_family:
+                counts_by_family[family] = self.token_counter.count_tokens(prompt, name)
+            token_counts[name] = counts_by_family[family]
+        return {
+            "query": request.query,
+            "query_type": query_type.value,
+            "classification_confidence": confidence,
+            "user_tier": request.user_tier.value,
+            "max_tokens": request.max_tokens,
+            "token_counts": token_counts,
+            "has_context": bool(request.context),
+        }
+
+    def _get_available_models(
+        self,
+        context: Dict[str, Any],
+    ) -> List[str]:
+        """Apply access and input-token limits; provider health is external.
+
+        Per P2, this checks input <= model.max_tokens, without reserving output.
+        """
+        return [
+            name for name, model in self.models.items()
+            if self._check_user_access(model, context["user_tier"])
+            and context["token_counts"][name] <= model.max_tokens
+        ]
+
+    async def _intelligent_routing(
+        self,
+        context: Dict[str, Any],
+    ) -> ModelCandidate:
+        """Match ordered rules, then fall through to capability routing."""
+        available = set(context["available_models"])
+        for rule in self.routing_rules:
+            # Supply a scalar token_count for each model; do not use a
+            # default-model estimate for every rule/candidate.
+            matching = [
+                name for name in dict.fromkeys(rule.models)
+                if name in self.models and rule.matches({
+                    **context, "token_count": context["token_counts"][name]
+                })
+            ]
+            candidates = [name for name in matching if name in available]
+            if candidates:
+                return ModelCandidate(
+                    self._select_best_model(candidates, context),
+                    context["classification_confidence"],
+                    f"Matched rule '{rule.name}': {rule.condition}",
+                )
+            if matching and rule.fallback in available:
+                return ModelCandidate(
+                    rule.fallback, 0.5, f"Fallback for matched rule '{rule.name}'"
+                )
+        return self._capability_based_routing(context)
+
+    def _capability_based_routing(
+        self,
+        context: Dict[str, Any],
+    ) -> ModelCandidate:
+        candidates = [
+            name for name in context["available_models"]
+            if self._has_capability(self.models[name], context["query_type"])
+        ]
+        if not candidates:
+            return self._fallback_routing(context)
+        return ModelCandidate(
+            self._select_best_model(candidates, context),
+            context["classification_confidence"],
+            "Selected by capability and composite score",
+        )
+
+    def _has_capability(
+        self,
+        model_config: ModelConfig,
+        query_type_value: str,
+    ) -> bool:
+        mapping = {
+            "general": ["general"],
+            "code_generation": ["coding"],
+            "code_analysis": ["coding", "analysis"],
+            "analysis": ["analysis", "reasoning"],
+            "summarization": ["writing", "analysis"],
+            "creative_writing": ["creative", "writing"],
+            "brainstorming": ["creative", "reasoning", "general"],
+            "planning": ["reasoning", "general"],
+            "question_answering": ["general"],
+            "translation": ["translation", "writing"],
+            "math": ["math", "reasoning"],
+            "reasoning": ["reasoning"],
+        }
+        return any(cap in model_config.capabilities
+                   for cap in mapping.get(query_type_value, ["general"]))
+
+    def _check_user_access(
+        self,
+        model_config: ModelConfig,
+        user_tier_value: str,
+    ) -> bool:
+        priorities = {"free": 3, "premium": 2, "enterprise": 1}
+        return (user_tier_value in priorities
+                and model_config.priority >= priorities[user_tier_value])
+
+    def _select_best_model(
+        self,
+        candidates: List[str],
+        context: Dict[str, Any],
+    ) -> str:
+        """P2 score, using request-specific input/output blended unit price.
+
+        success*40 + max(0, 20-latency_ms/100) + cost (capped at 20)
+        + (10-priority)*2 + context headroom (10 or 5). Free models get
+        the maximum cost score; cold-start stats are success=1, latency=0.
+        """
+        if not candidates:
+            raise ValueError("No candidates to score")
+
+        def score(name: str) -> float:
+            model = self.models[name]
+            stats = self.model_stats.get(name, {})
+            tokens = context["token_counts"][name]
+            output_tokens = min(tokens * 0.5, context["max_tokens"])
+            estimated_cost = self._estimate_cost(ModelCandidate(name, 0.0, "scoring"), context)
+            total_tokens = tokens + output_tokens
+            effective_price = estimated_cost / total_tokens if total_tokens else 0.0
+            cost_score = 20.0 if effective_price == 0 else min(
+                1.0 / (effective_price * 1e6), 20.0
+            )
+            context_score = (10 if tokens <= model.max_tokens * 0.8
+                             else 5 if tokens <= model.max_tokens else 0)
+            return (
+                stats.get("success_rate", 1.0) * 40
+                + max(0, 20 - stats.get("avg_latency", 0.0) / 100)
+                + cost_score + (10 - model.priority) * 2 + context_score
+            )
+
+        # max preserves the first candidate when scores tie.
+        return max(candidates, key=score)
+
+    def _round_robin_routing(
+        self,
+        context: Dict[str, Any],
+    ) -> ModelCandidate:
+        available = context["available_models"]
+        if not available:
+            return self._fallback_routing(context)
+        name = available[self._request_count % len(available)]
+        self._request_count += 1
+        return ModelCandidate(name, 0.5, "Round-robin selection")
+
+    def _weighted_routing(
+        self,
+        context: Dict[str, Any],
+    ) -> ModelCandidate:
+        available = context["available_models"]
+        if not available:
+            return self._fallback_routing(context)
+        weights = [1.0 / self.models[name].priority for name in available]
+        total = sum(weights)
+        name = random.choices(available, weights=[w / total for w in weights], k=1)[0]
+        return ModelCandidate(name, 0.5, "Weighted selection using inverse model priority")
+
+    def _fallback_routing(
+        self,
+        context: Dict[str, Any],
+    ) -> ModelCandidate:
+        """P2 default nomination, including when the eligible pool is empty.
+
+        This does not certify input capacity, access, or provider readiness.
+        The caller must not treat a fallback decision as execution validation.
+        """
+        return ModelCandidate(self.default_model, 0.0, "Selected configured default model")
+
+    def _estimate_cost(
+        self,
+        selection: ModelCandidate,
+        context: Dict[str, Any],
+    ) -> float:
+        """Estimate separate input-token and output-token costs."""
+        model = self.models[selection.model_name]
+        input_tokens = context["token_counts"][selection.model_name]
+        output_tokens = min(input_tokens * 0.5, context["max_tokens"])
+        return float(input_tokens * model.cost_input_token
+                     + output_tokens * model.cost_output_token)
+
+    def update_model_stats(
+        self,
+        model_name: str,
+        success: bool,
+        latency_ms: int,
+    ) -> None:
+        try:
+            if latency_ms < 0 or not math.isfinite(latency_ms):
+                raise ValueError("latency_ms must be finite and nonnegative")
+            stats = dict(self.model_stats[model_name])
+            stats["total_requests"] += 1
+            stats["successful_requests"] += int(success)
+            stats["total_latency"] += latency_ms
+            stats["success_rate"] = stats["successful_requests"] / stats["total_requests"]
+            stats["avg_latency"] = stats["total_latency"] / stats["total_requests"]
+            self.model_stats[model_name] = stats
+        except Exception as exc:
+            logger.warning("Model stats update failed for '%s': %s", model_name, exc)
+
+    def get_model_info(self, model_name: str) -> Optional[Dict[str, Any]]:
+        model_config = self.models.get(model_name)
+        if model_config is None:
+            return None
+
+        return {
+            "name": model_name,
+            "config": model_config.model_dump(),
+            "stats": dict(self.model_stats[model_name]),
+        }
+
+    def get_routing_stats(self) -> Dict[str, Any]:
+        """Return a snapshot; request_count is the round-robin cursor only."""
+        return {
+            "routing_strategy": self.routing_strategy,
+            "default_model": self.default_model,
+            "request_count": self._request_count,
+            "models": {
+                model_name: dict(stats)
+                for model_name, stats in self.model_stats.items()
+            },
+        }

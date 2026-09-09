@@ -222,28 +222,24 @@ router:
         - gpt-5.6-terra
         - claude-5-sonnet
       fallback: mistral-7b
-      weight: 1.0
     - name: long_context_analysis
       condition: "query_type == 'analysis' and token_count >= 5000"
       models:
         - claude-5-sonnet
         - gpt-5.6-terra
       fallback: llama-3.1-70b
-      weight: 1.0
     - name: premium_tier
       condition: "user_tier == 'premium'"
       models:
         - gpt-5.6-terra
         - claude-5-sonnet
       fallback: mistral-7b
-      weight: 1.0
     - name: free_tier
       condition: "user_tier == 'free'"
       models:
         - mistral-7b
         - llama-3.1-70b
       fallback: mistral-7b
-      weight: 1.0
 
 inference:
   vllm:

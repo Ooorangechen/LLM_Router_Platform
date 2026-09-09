@@ -12,6 +12,7 @@ FALLBACK_CONFIDENCE = 0.5
 
 _FALLBACK_TOKENS_PER_WORD = 1.3
 _TOKEN_RE = re.compile(r"[a-z0-9_+#]+")
+_CHINESE_SPAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
 TOKENIZER_FAMILIES: Dict[str, Dict[str, str]] = {
     "gpt": {
@@ -39,7 +40,13 @@ class QueryClassifier:
     """
     def __init__(self) -> None:
         self.patterns: Dict[QueryType, List[str]] = self._init_patterns()
+        self.chinese_patterns: Dict[
+            QueryType, List[str]
+        ] = self._init_chinese_patterns()
         self.keywords: Dict[QueryType, List[str]] = self._init_keywords()
+        self.chinese_keywords: Dict[
+            QueryType, List[str]
+        ] = self._init_chinese_keywords()
         self.tfidf = None
         self._is_initialized = False
 
@@ -116,6 +123,79 @@ class QueryClassifier:
             ],
         }
 
+    def _init_chinese_patterns(self) -> Dict[QueryType, List[str]]:
+        return {
+            QueryType.TRANSLATION: [
+                r"(翻译|翻成|译成|转译|转换成).{0,12}"
+                r"(中文|英文|英语|日文|日语|韩文|韩语|法文|法语|德文|德语|西班牙语)",
+                r"(中译英|英译中|汉译英|英译汉)",
+                r"(这句|这段|这篇|以下内容).{0,8}(怎么翻译|如何翻译|是什么意思)",
+                r"用(中文|英文|英语|日文|日语|韩文|韩语).{0,6}(表达|改写|说明)",
+            ],
+            QueryType.MATH: [
+                r"(计算|求解|解出|证明|推导).{0,15}(方程|公式|结果|数值|定理)",
+                r"(导数|微分|积分|极限|概率|矩阵|向量|几何|代数)",
+                r"\d+\s*[\+\-\*/×÷\^=]\s*\d+",
+                r"(平均数|中位数|百分比|标准差|方差|行列式)",
+            ],
+            QueryType.CODE_ANALYSIS: [
+                r"(调试|排查|修复|定位).{0,15}(代码|程序|错误|问题|异常|故障)",
+                r"(报错|异常|崩溃|闪退|堆栈|追踪|内存泄漏)",
+                r"(优化|重构|改进).{0,15}(代码|性能|复杂度|内存|速度)",
+                r"(分析|审查|解释).{0,15}(代码|函数|类|脚本|实现)",
+            ],
+            QueryType.CODE_GENERATION: [
+                r"(写|编写|生成|创建|实现|开发).{0,15}(代码|函数|类|脚本|程序|接口|服务)",
+                r"(使用|用).{0,10}"
+                r"(Python|Java|JavaScript|TypeScript|C\+\+|Go|Rust|SQL)"
+                r".{0,15}(写|实现|开发)",
+                r"(定义|实现).{0,10}(函数|类|接口|算法|数据结构)",
+                r"(帮我|请).{0,6}(写|实现|生成).{0,15}(代码|程序|函数)",
+            ],
+            QueryType.SUMMARIZATION: [
+                r"(总结|概括|归纳|提炼).{0,12}(内容|文章|文本|报告|要点|重点)",
+                r"(生成|写).{0,8}(摘要|概要|总结)",
+                r"(简要|简短|一句话).{0,8}(说明|概括|总结)",
+                r"(提取|列出).{0,10}(要点|重点|结论|关键信息)",
+            ],
+            QueryType.CREATIVE_WRITING: [
+                r"(写|创作|编写).{0,12}(故事|诗歌|小说|文案|剧本|歌词|散文)",
+                r"(设计|塑造).{0,10}(角色|人物|情节|世界观|对白)",
+                r"(续写|改写|润色).{0,12}(故事|文章|文案|剧情)",
+                r"(想象|虚构|扮演).{0,15}",
+            ],
+            QueryType.BRAINSTORMING: [
+                r"(头脑风暴|集思广益)",
+                r"(给出|提供|生成|列出).{0,10}(想法|点子|创意|方案|建议|备选)",
+                r"(还有什么|其他可能|更多选择|更多思路)",
+                r"(想几个|给几个|列举).{0,10}(方案|名字|点子|创意|方向)",
+            ],
+            QueryType.PLANNING: [
+                r"(制定|设计|创建|安排).{0,12}(计划|规划|路线图|日程|时间表)",
+                r"(步骤|流程|阶段|里程碑|时间线)",
+                r"(如何|怎么).{0,8}(开始|推进|准备|安排|规划)",
+                r"(项目|旅行|活动|学习|冲刺).{0,12}(计划|安排|规划)",
+            ],
+            QueryType.ANALYSIS: [
+                r"(分析|评估|研究|考察).{0,15}(数据|趋势|影响|原因|结果|表现)",
+                r"(比较|对比|区别).{0,15}",
+                r"(趋势|模式|洞察|相关性|分布|构成)",
+                r"(影响|效果|后果|含义|启示).{0,12}(是什么|有哪些|如何)",
+            ],
+            QueryType.REASONING: [
+                r"(为什么|为何|原因是什么|理由是什么)",
+                r"(推理|推断|演绎|归纳|论证)",
+                r"(如果|假设|假如).{0,30}(那么|则|会不会|是否)",
+                r"(逻辑|前提|结论|谬误|矛盾|因果)",
+            ],
+            QueryType.QUESTION_ANSWERING: [
+                r"^\s*(什么是|谁是|何时|什么时候|哪里|哪个|多少|几种)",
+                r"(请问|告诉我|介绍一下|解释一下).{0,20}",
+                r"(定义|含义|意思|全称).{0,10}(是什么|指什么|为)",
+                r".{0,20}(是什么|有哪些|在哪里|有多少)\s*[？?]?$",
+            ],
+        }
+
     def _init_keywords(self) -> Dict[QueryType, List[str]]:
         return {
             QueryType.TRANSLATION: [
@@ -168,6 +248,54 @@ class QueryClassifier:
             ],
         }
 
+    def _init_chinese_keywords(self) -> Dict[QueryType, List[str]]:
+        return {
+            QueryType.TRANSLATION: [
+                "翻译", "译成", "转译", "中译英",
+                "英译中", "中文", "英文", "日文",
+            ],
+            QueryType.MATH: [
+                "计算", "求解", "方程", "导数",
+                "积分", "概率", "矩阵", "证明",
+            ],
+            QueryType.CODE_ANALYSIS: [
+                "调试", "修复", "报错", "异常",
+                "性能", "优化", "复杂度", "代码审查",
+            ],
+            QueryType.CODE_GENERATION: [
+                "写代码", "编写", "实现", "函数",
+                "类定义", "脚本", "接口", "程序",
+            ],
+            QueryType.SUMMARIZATION: [
+                "总结", "摘要", "概括", "归纳",
+                "要点", "简述", "精简", "提炼",
+            ],
+            QueryType.CREATIVE_WRITING: [
+                "故事", "诗歌", "小说", "文案",
+                "剧本", "创作", "角色", "情节",
+            ],
+            QueryType.BRAINSTORMING: [
+                "头脑风暴", "点子", "创意", "想法",
+                "方案", "建议", "备选", "思路",
+            ],
+            QueryType.PLANNING: [
+                "计划", "规划", "路线图", "时间表",
+                "里程碑", "日程", "步骤", "安排",
+            ],
+            QueryType.ANALYSIS: [
+                "分析", "评估", "比较", "对比",
+                "趋势", "模式", "洞察", "相关性",
+            ],
+            QueryType.REASONING: [
+                "为什么", "推理", "推断", "逻辑",
+                "前提", "结论", "假设", "论证",
+            ],
+            QueryType.QUESTION_ANSWERING: [
+                "什么是", "谁是", "何时", "哪里",
+                "多少", "解释", "定义", "介绍",
+            ],
+        }
+
 
     async def initialize(self) -> None:
         try:
@@ -180,31 +308,36 @@ class QueryClassifier:
             self._is_initialized = True
 
     def _keyword_classification(self, query: str) -> Dict[QueryType, float]:
-        """ 
-        score = hits / total keywords count
-        """
+        """Score exact English and Chinese keyword-set intersections."""
         text = query.lower()
         tokens = set(_TOKEN_RE.findall(text))
 
+        for match in _CHINESE_SPAN_RE.finditer(text):
+            span = match.group(0)
+            max_ngram_size = min(6, len(span))
+            for size in range(1, max_ngram_size + 1):
+                for start in range(len(span) - size + 1):
+                    tokens.add(span[start:start + size])
+
         scores: Dict[QueryType, float] = {}
         for query_type, words in self.keywords.items():
-            if not words:
-                scores[query_type] = 0.0
-                continue
+            english_keywords = {word.lower() for word in words}
+            chinese_keywords = {
+                word.lower()
+                for word in self.chinese_keywords.get(query_type, [])
+            }
 
-            hits = 0
-            for word in words:
-                if " " in word or not word.isascii():
-                    matched = word in text
-                else:
-                    matched = any(
-                        t == word or (t.startswith(word) and len(t) - len(word) <= 3)
-                        for t in tokens
-                    )
-                if matched:
-                    hits += 1
-
-            scores[query_type] = hits / len(words)
+            english_score = (
+                len(tokens & english_keywords) / len(english_keywords)
+                if english_keywords
+                else 0.0
+            )
+            chinese_score = (
+                len(tokens & chinese_keywords) / len(chinese_keywords)
+                if chinese_keywords
+                else 0.0
+            )
+            scores[query_type] = max(english_score, chinese_score)
 
         return scores
 
@@ -222,11 +355,28 @@ class QueryClassifier:
         best_score = 0.0
 
         for query_type, patterns in self.patterns.items():
-            if patterns:
-                matched = sum(1 for p in patterns if re.findall(p, text))
-                pattern_score = matched / len(patterns)
-            else:
-                pattern_score = 0.0
+            english_pattern_score = (
+                sum(1 for pattern in patterns if re.findall(pattern, text))
+                / len(patterns)
+                if patterns
+                else 0.0
+            )
+
+            chinese_patterns = self.chinese_patterns.get(query_type, [])
+            chinese_pattern_score = (
+                sum(
+                    1
+                    for pattern in chinese_patterns
+                    if re.findall(pattern, text)
+                )
+                / len(chinese_patterns)
+                if chinese_patterns
+                else 0.0
+            )
+            pattern_score = max(
+                english_pattern_score,
+                chinese_pattern_score,
+            )
 
             keyword_score = keyword_scores.get(query_type, 0.0)
             final_score = pattern_score * PATTERN_WEIGHT + keyword_score * KEYWORD_WEIGHT

@@ -158,18 +158,20 @@ router:
     mistral-7b:
       provider: vllm
       api_key_env: VLLM_API_KEY
-      max_tokens: 8192
+      max_tokens: 32768
       cost_input_token: 0.0
       cost_output_token: 0.0
-      priority: 1
+      priority: 3
       capabilities:
         - general
         - math
+        - coding
       gpu_memory_gb: 16
+      model_path: null
     gpt-5.6-terra:
       provider: openai
       api_key_env: OPENAI_API_KEY
-      max_tokens: 8192
+      max_tokens: 128000
       cost_input_token: 2.0e-06
       cost_output_token: 1.2e-05
       priority: 2
@@ -177,11 +179,14 @@ router:
         - coding
         - reasoning
         - analysis
+        - math
         - general
+        - creative
+      model_path: null
     claude-5-sonnet:
       provider: anthropic
       api_key_env: ANTHROPIC_API_KEY
-      max_tokens: 8192
+      max_tokens: 200000
       cost_input_token: 2.0e-06
       cost_output_token: 1.0e-05
       priority: 2
@@ -191,67 +196,94 @@ router:
         - analysis
         - reasoning
         - general
+        - coding
+      model_path: null
     llama-3.1-70b: 
       provider: vllm
       api_key_env: VLLM_API_KEY
-      max_tokens: 8192
+      max_tokens: 131072
       cost_input_token: 0.0
       cost_output_token: 0.0
-      priority: 1
+      priority: 3
       capabilities:
         - reasoning
         - analysis
         - general
         - translation
+        - writing
+        - coding
       gpu_memory_gb: 160
+      model_path: null
 
   routing_rules:
     - name: code_generation
       condition: "query_type == 'code_generation'"
-      target_model: gpt-4-turbo
+      models:
+        - gpt-5.6-terra
+        - claude-5-sonnet
+      fallback: mistral-7b
+      weight: 1.0
     - name: long_context_analysis
-      condition: "query_type == 'analysis' and context_length > 20000"
-      target_model: claude-3.5-sonnet
+      condition: "query_type == 'analysis' and token_count >= 5000"
+      models:
+        - claude-5-sonnet
+        - gpt-5.6-terra
+      fallback: llama-3.1-70b
+      weight: 1.0
     - name: premium_tier
       condition: "user_tier == 'premium'"
-      target_model: claude-3.5-sonnet
+      models:
+        - gpt-5.6-terra
+        - claude-5-sonnet
+      fallback: mistral-7b
+      weight: 1.0
     - name: free_tier
       condition: "user_tier == 'free'"
-      target_model: mistral-7b
+      models:
+        - mistral-7b
+        - llama-3.1-70b
+      fallback: mistral-7b
+      weight: 1.0
 
 inference:
   vllm:
     host: localhost
     port: 8001
     base_url: http://localhost:8001/v1
-    timeout: 60
+    api_key_env: VLLM_API_KEY
+    timeout: 300
     retries: 3
   openai:
     host: api.openai.com
     port: 443
     base_url: https://api.openai.com/v1
-    timeout: 30
+    api_key_env: OPENAI_API_KEY
+    timeout: 60
     retries: 3
   anthropic:
     host: api.anthropic.com
     port: 443
-    base_url: https://api.anthropic.com/v1
-    timeout: 30
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    timeout: 60
     retries: 3
   compression:
     enabled: false
-    max_context_tokens: 100000
-    compression_ratio: 0.5
-    method: summarization
+    max_context_tokens: 6000
+    compression_ratio: 0.3
+    method: semantic_graph
   cache:
     enabled: false
     backend: redis
+    host: localhost
+    port: 6379
+    db: 0
     ttl: 3600
     max_size: 10000
   batching:
     enabled: false
     max_batch_size: 32
-    max_wait_time_ms: 100
+    max_wait_time_ms: 50
   
 kafka:
   enabled: false
@@ -295,7 +327,7 @@ monitoring:
   prometheus_port: 8000
 
   prometheus:
-    scrape_interval: 15s
+    scrape_interval_seconds: 15
   
   grafana:
     port: 3000
@@ -304,13 +336,13 @@ monitoring:
   
   alerts:
     error_rate_threshold: 0.05
-    latency_p95_threshold_ms: 2000
+    latency_p95_threshold_seconds: 2.0
     cpu_usage_threshold: 0.85
     memory_usage_threshold: 0.85
   
   health_checks:
-    interval: 30s
-    timeout: 5s
+    interval_seconds: 30
+    timeout_seconds: 5
   
 slack:
   enabled: false
@@ -332,7 +364,7 @@ slack:
     rpm: 20
 
 streamlit:
-  enabled: true
+  enabled: false
   port: 8501
   host: "0.0.0.0"
 
@@ -353,7 +385,7 @@ flink:
   parallelism: 2
   checkpointing:
     enabled: true
-    interval_ms: 60000
+    interval_seconds: 60
     mode: exactly_once
 
 security:
@@ -441,10 +473,10 @@ policies:
         hourly: 1000
 
   sla:
-    latency_slas:
-      free: 10s
-      premium: 5s
-      enterprise: 2s
+    latency_sla_seconds:
+      free: 10.0
+      premium: 5.0
+      enterprise: 2.0
   
   budget: 
     cost_budgets:
@@ -453,15 +485,15 @@ policies:
       enterprise: 1.00
   
   circuit_breaker: 
-    enabled: true
+    enabled: false
     failure_threshold: 5
-    recovery_timeout_s: 30
+    recovery_timeout_seconds: 30
   
 optimization:
   enabled: false
   kv_cache_size_gb: 8
   max_batch_size: 32
-  max_wait_ms: 100
+  max_wait_seconds: 0.1
   flash_attn: true
   tensorrt: false
 
@@ -469,17 +501,17 @@ quality:
   monitor:
     enabled: false
     window_size: 100
-    window_duration_minutes: 60
+    window_duration_seconds: 3600
 
   slo_targets:
     availability: 0.999
-    latency_p95_ms: 2000
+    latency_p95_seconds: 2.0
     error_rate_max: 0.01
   
   feedback:
     storage_path: data/feedback
   
-  health_check_interval_s: 30
+  health_check_interval_seconds: 30
 
 router_mode:
   use_integrated_router: false"""

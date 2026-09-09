@@ -79,9 +79,24 @@ class RouterMetrics:
                                          "number of routing decision made",
                                          labelnames=["model", "query_type"])
 
-        self.routing_latency = Histogram("llm_router_router_routing_latency_ms",
-                                         "routing decision latency in ms", 
-                                         buckets=[1,5,10,25,50,100,250,500, 1000, float("inf")])
+        self.routing_duration = Histogram(
+            "llm_router_router_routing_duration_seconds",
+            "Routing decision duration in seconds",
+            buckets=[
+                0.0005,
+                0.001,
+                0.0025,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+                float("inf"),
+            ],
+        )
 
         self.routing_confidence = Histogram("llm_router_router_routing_confidence",
                                             "routing confidence level", 
@@ -163,10 +178,25 @@ class PipelineMetrics:
                                        "total number of databse writes",
                                        labelnames=["table", "status"])
 
-        self.db_write_latency = Histogram("llm_router_pipeline_db_write_latency_ms",
-                                        "latency of database writes in ms",
-                                        labelnames=["table"],
-                                        buckets=[1,5,10,25,50,100,250,500, 1000, float("inf")])
+        self.db_write_duration = Histogram(
+            "llm_router_pipeline_db_write_duration_seconds",
+            "Database write duration in seconds",
+            labelnames=["table"],
+            buckets=[
+                0.001,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+                2.5,
+                5.0,
+                float("inf"),
+            ],
+        )
 
         self.consumer_lag = Gauge("llm_router_pipeline_consumer_lag",
                                   "Pipeline consumer lag",

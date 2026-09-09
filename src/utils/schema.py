@@ -194,7 +194,10 @@ class ModelConfig(BaseModel):
     name: str
     provider: str
     max_tokens: int = Field(ge=1)
-    cost_per_token: float = Field(ge=0.0)
+
+    cost_input_token: float = Field(default=0.0, ge=0.0)
+    cost_output_token: float = Field(default=0.0, ge=0.0)
+
     priority: int = Field(ge=1)
     capabilities: List[str] = Field(min_length=1)
 

@@ -13,9 +13,23 @@ FALLBACK_CONFIDENCE = 0.5
 _FALLBACK_TOKENS_PER_WORD = 1.3
 _TOKEN_RE = re.compile(r"[a-z0-9_+#]+")
 
-HF_TOKENIZER_REPOS: Dict[str, str] = {
-    "llama": "unsloth/Meta-Llama-3.1-70B-Instruct",
-    "mistral": "mistralai/Mistral-7B-Instruct-v0.3",
+TOKENIZER_FAMILIES: Dict[str, Dict[str, str]] = {
+    "gpt": {
+        "backend": "tiktoken",
+        "name": "o200k_base",
+    },
+    "claude": {
+        "backend": "tiktoken",
+        "name": "o200k_base",
+    },
+    "llama": {
+        "backend": "huggingface",
+        "name": "meta-llama/Llama-3.1-70B-Instruct",
+    },
+    "mistral": {
+        "backend": "huggingface",
+        "name": "mistralai/Mistral-7B-Instruct-v0.3",
+    },
 }
 
 
@@ -228,51 +242,81 @@ class QueryClassifier:
 
 class TokenCounter:
     def __init__(self) -> None:
-        self.endoders: Dict[str, Any] = {}
+        self.encoders: Dict[str, Callable[[str], int]] = {}
         self.encoder_names: Dict[str, str] = {}
         self._initialize_encoders()
 
-    def _initialize_encoders(self):
-        cl100k_counter: Optional[Callable[[str], int]] = None
+    def _initialize_encoders(self) -> None:
+        default_counter: Optional[Callable[[str], int]] = None
+
         try:
             import tiktoken
-            o200k_enc = tiktoken.get_encoding("o200k_base")
-            cl100k_enc = tiktoken.get_encoding("cl100k_base")
-            cl100k_counter = lambda t: len(cl100k_enc.encode(t))
-            o200k_counter = lambda t: len(o200k_enc.encode(t))
 
-            self.encoders["gpt"] = o200k_counter
-            self.encoders["claude"] = cl100k_counter
-            self.encoders["default"] = cl100k_counter
-            self.encoder_names.update(
-                {"gpt": "o200k_base", "claude": "cl100k_base", "default": "cl100k_base"}
+            default_encoder = tiktoken.get_encoding("cl100k_base")
+            default_counter = lambda text: len(
+                default_encoder.encode(text, disallowed_special=())
+            )
+            self.encoders["default"] = default_counter
+            self.encoder_names["default"] = "tiktoken:cl100k_base"
+
+            for family, spec in TOKENIZER_FAMILIES.items():
+                if spec["backend"] != "tiktoken":
+                    continue
+
+                encoder = tiktoken.get_encoding(spec["name"])
+                self.encoders[family] = (
+                    lambda text, _encoder=encoder: len(
+                        _encoder.encode(text, disallowed_special=())
+                    )
+                )
+                self.encoder_names[family] = f"tiktoken:{spec['name']}"
+
+        except Exception as exc:
+            logger.warning(
+                "tiktoken initialization failed; affected model families will "
+                "use word-count approximation: %s: %s",
+                type(exc).__name__,
+                exc,
             )
 
-        except Exception as e:
-            logger.warning(
-                f"tiktoken unavailable, gpt/claude/default will use "
-                f"word-count approximation: {type(e).__name__}: {e}")
+        for family, spec in TOKENIZER_FAMILIES.items():
+            if spec["backend"] != "huggingface":
+                continue
 
-        for key, repo in HF_TOKENIZER_REPOS.items():
             try:
                 from transformers import AutoTokenizer
-                tok = AutoTokenizer.from_pretrained(repo)
-                self.encoders[key] = (
-                    lambda t, _tok=tok: len(_tok.encode(t, add_special_tokens=False))
-                )
-                self.encoder_names[key] = f"{repo} (vocab={tok.vocab_size})"
-            except Exception as e:
-                if cl100k_counter is not None:
-                    self.encoders[key] = cl100k_counter
-                    self.encoder_names[key] = "cl100k_base (fallback)"
-                logger.warning(
-                    f"Failed to load HF tokenizer '{repo}' for key '{key}', "
-                    f"falling back to cl100k_base: {type(e).__name__}: {e}"
-                )
-        logger.info(f"Token encoders initialized: {self.encoder_names}")
 
-    def _get_encoder_key(self, model:str) -> str:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    spec["name"],
+                    use_fast=True,
+                    trust_remote_code=False,
+                )
+                self.encoders[family] = (
+                    lambda text, _tokenizer=tokenizer: len(
+                        _tokenizer.encode(text, add_special_tokens=False)
+                    )
+                )
+                self.encoder_names[family] = (
+                    f"huggingface:{spec['name']} (vocab={len(tokenizer)})"
+                )
+            except Exception as exc:
+                if default_counter is not None:
+                    self.encoders[family] = default_counter
+                    self.encoder_names[family] = "tiktoken:cl100k_base (fallback)"
+                logger.warning(
+                    "Failed to load Hugging Face tokenizer '%s' for family "
+                    "'%s'; using the available fallback: %s: %s",
+                    spec["name"],
+                    family,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        logger.info("Token encoders initialized: %s", self.encoder_names)
+
+    def _get_encoder_key(self, model: str) -> str:
         model_lower = (model or "").lower()
+
         if "gpt" in model_lower:
             return "gpt"
         if "claude" in model_lower:
@@ -282,16 +326,21 @@ class TokenCounter:
         if "mistral" in model_lower or "mixtral" in model_lower:
             return "mistral"
         return "default"
-        
-    def count_toknes(self, text: str, model: str ="default") -> int:
+
+    def count_tokens(self, text: str, model: str = "default") -> int:
         if not text:
             return 0
-        try:
-            return self.encoders[self._get_encoder_key(model)](text)
-        except Exception as e:
-            logger.warning(
-                f"Token counting failed for model='{model}', "
-                f"falling back to word-count approximation: {type(e).__name__}: {e}"
-            )
-            return int(len(text.split()) * _FALLBACK_TOKENS_PER_WORD)
 
+        try:
+            encoder_key = self._get_encoder_key(model)
+            token_count = self.encoders[encoder_key](text)
+            return max(0, int(token_count))
+        except Exception as exc:
+            logger.warning(
+                "Token counting failed for model='%s'; falling back to "
+                "word-count approximation: %s: %s",
+                model,
+                type(exc).__name__,
+                exc,
+            )
+            return max(0, round(len(text.split()) * _FALLBACK_TOKENS_PER_WORD))

@@ -53,7 +53,7 @@ router:
         - general
         - creative
       model_path: null
-    claude-5-sonnet:
+    claude-sonnet-5:
       provider: anthropic
       api_key_env: ANTHROPIC_API_KEY
       max_tokens: 200000
@@ -90,19 +90,19 @@ router:
       condition: "query_type == 'code_generation'"
       models:
         - gpt-5.6-terra
-        - claude-5-sonnet
+        - claude-sonnet-5
       fallback: mistral-7b
     - name: long_context_analysis
       condition: "query_type == 'analysis' and token_count >= 5000"
       models:
-        - claude-5-sonnet
+        - claude-sonnet-5
         - gpt-5.6-terra
       fallback: llama-3.1-70b
     - name: premium_tier
       condition: "user_tier == 'premium'"
       models:
         - gpt-5.6-terra
-        - claude-5-sonnet
+        - claude-sonnet-5
       fallback: mistral-7b
     - name: free_tier
       condition: "user_tier == 'free'"

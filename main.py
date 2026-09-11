@@ -8,9 +8,13 @@ from pathlib import Path
 from copy import deepcopy
 import click
 import yaml
+from dotenv import load_dotenv
 
 from src.llm_router_part0_setup import setup_project_environment
+from src.llm_router_part1_router import ModelRouter
+from src.llm_router_part2_inference import InferenceEngine
 from src.utils.logger import setup_logging, get_logger
+from src.utils.schema import QueryRequest, UserTier
 import src.utils.metrics  
 
 DEFAULTS_CONFIG_PATH = "config/defaults.yaml"
@@ -35,6 +39,7 @@ class LLMRouterPlatform:
     def __init__(self, config_path: str = CONFIG_PATH, defaults_config_path: str = DEFAULTS_CONFIG_PATH,):
         self.config_path = Path(config_path)
         self.defaults_config_path = Path(defaults_config_path)
+        load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
         self.config = self._load_config()
         self.services = {}
         self._setup_logging()
@@ -115,20 +120,33 @@ class LLMRouterPlatform:
         setup_logging(**kwargs)
 
     async def _initialize_services(self):
-        """ P1 phase only do the log"""
+        """Initialize the modular P2 router and inference services."""
         self.logger.info("Initializing LLM Router Platform services...")
+
+        router = ModelRouter(self.config["router"])
+        await router.initialize()
+        self.services["router"] = router
+
+        inference = InferenceEngine(self.config["inference"], router=router)
+        await inference.initialize()
+        self.services["inference"] = inference
+
         self.logger.info("All services initialized successfully")
 
     async def _start_services(self):
         import uvicorn
         app = self._create_fastapi_app()
 
-        if _PROM_AVAILABLE:
-            try:
-                prom_port = self.config.get("monitoring", {}).get("prometheus_port", 8000)
-                start_http_server(prom_port)
-            except Exception as e:
-                self.logger.warning(f"Prometheus metrics server failed to start: {e} ")
+        monitoring_cfg = self.config.get("monitoring", {})
+        if monitoring_cfg.get("enabled", False):
+            if not _PROM_AVAILABLE:
+                self.logger.warning("Prometheus metrics are enabled but prometheus_client is unavailable")
+            else:
+                try:
+                    prom_port = monitoring_cfg.get("prometheus_port", 8000)
+                    start_http_server(prom_port)
+                except Exception as e:
+                    self.logger.warning(f"Prometheus metrics server failed to start: {e} ")
 
         api_cfg = self.config.get("api", {})
         host = api_cfg.get("host", "0.0.0.0")
@@ -140,26 +158,22 @@ class LLMRouterPlatform:
         await server.serve()
 
     async def _shutdown_services(self):
-        """ 
-        Shut down services in reversed order.
-        Only logging in P1
-        """
+        """Shut down initialized services in reverse order."""
         self.logger.info(f"shutting down services...")
         for name in reversed(list(self.services.keys())):
             self.logger.info(f"Stopping services: {name}")
+            service = self.services[name]
+            if hasattr(service, "shutdown"):
+                await service.shutdown()
+        self.services.clear()
         self.logger.info("Shutdown complete")
 
     def _signal_handler(self, signum, frame):
         self.logger.info(f"Received signal {signum}. Shutting down...")
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(self._shutdown_services())
-        except RuntimeError:
-            pass
         sys.exit(0)
 
     def _create_fastapi_app(self):
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.middleware.cors import CORSMiddleware
         app = FastAPI(
             title="LLM Router & Execution Platform",
@@ -225,6 +239,8 @@ class LLMRouterPlatform:
         async def reload_config():
             try:
                 self.config = self._load_config()
+                await self._shutdown_services()
+                await self._initialize_services()
                 return {"status": "config_reloaded"}
             except BaseException as exc:
                 # §3.5 要求 _load_config 遇到坏配置时 sys.exit(1)，而 sys.exit 抛的是
@@ -239,14 +255,55 @@ class LLMRouterPlatform:
                 "count": len(self.services),
             }
 
+        @app.post("/route")
+        async def route_query(request: Request):
+            try:
+                payload = await request.json()
+                query_request = QueryRequest(
+                    query=payload.get("query"),
+                    user_id=payload.get("user_id"),
+                    user_tier=UserTier(payload.get("user_tier", "free")),
+                    context=payload.get("context"),
+                    max_tokens=payload.get("max_tokens", 512),
+                    temperature=payload.get("temperature", 1.0),
+                )
+                response = await self.services["inference"].process_query(query_request)
+                if response.error:
+                    raise RuntimeError(response.error)
+
+                src.utils.metrics.SYSTEM_METRICS.requests_total.labels(
+                    endpoint="/route", method="POST", status="200"
+                ).inc()
+                return {
+                    "query_id": str(query_request.request_id),
+                    "response": response.response_text,
+                    "model_name": response.model_name,
+                    "tokens": {
+                        "input": response.token_count_input,
+                        "output": response.token_count_output,
+                        "total": response.total_tokens,
+                    },
+                    "cost_usd": response.cost_usd,
+                    "latency_ms": response.latency_ms,
+                    "cached": response.cached,
+                }
+            except Exception as exc:
+                src.utils.metrics.SYSTEM_METRICS.errors_total.labels(
+                    component="api", error_type=type(exc).__name__
+                ).inc()
+                raise HTTPException(status_code=500, detail=str(exc))
+
         return app
         
     async def run(self):
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
-        await self._initialize_services()
-        await self._start_services()
+        try:
+            await self._initialize_services()
+            await self._start_services()
+        finally:
+            await self._shutdown_services()
 
 app = None
 
@@ -259,6 +316,10 @@ if os.getenv("LLM_ROUTER_DEV_MODE") == "true":
     @app.on_event("startup")
     async def _dev_startup():
         await _dev_platform._initialize_services()
+
+    @app.on_event("shutdown")
+    async def _dev_shutdown():
+        await _dev_platform._shutdown_services()
 
 @click.group()
 def cli():

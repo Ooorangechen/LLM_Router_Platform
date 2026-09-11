@@ -134,12 +134,12 @@ inference:
     timeout: 60
     retries: 3
   compression:
-    enabled: false
+    enabled: true
     max_context_tokens: 6000
     compression_ratio: 0.3
     method: semantic_graph
   cache:
-    enabled: false
+    enabled: true
     backend: redis
     host: localhost
     port: 6379

@@ -49,14 +49,30 @@ class ContextCompressor:
         # P2 uses text heuristics only; no external resources to initialize.
         return
 
-    async def compress_context(self, context: str, model_name: str) -> str:
-        """Estimate context tokens once, derive a budget, and dispatch compression."""
+    def _count_tokens(self, text: str, model_name: str) -> int:
+        try:
+            return self.token_counter.count_tokens(text, model_name)
+        except Exception as exc:
+            logger.warning(
+                "Compressor token counting failed for model='%s'; falling back to "
+                "character count: %s: %s",
+                model_name, type(exc).__name__, exc,
+            )
+            return len(text)
+
+    async def compress_context(
+        self, context: str, model_name: str, target_tokens: Optional[int] = None,
+    ) -> str:
+        """Use an explicit token budget or derive one above the configured threshold."""
         if not self.enabled or not context:
             return context
-        original_tokens = self.token_counter.count_tokens(context, model_name)
-        if original_tokens <= self.max_context_tokens:
+        original_tokens = self._count_tokens(context, model_name)
+        if target_tokens is None:
+            if original_tokens <= self.max_context_tokens:
+                return context
+            target_tokens = min(int(original_tokens * self.compression_ratio), self.max_context_tokens)
+        if original_tokens <= target_tokens:
             return context
-        target_tokens = min(int(original_tokens * self.compression_ratio), self.max_context_tokens)
         if target_tokens <= 0:
             return ""
         methods = {
@@ -102,7 +118,7 @@ class ContextCompressor:
         result = ""
         for index in ranked:
             candidate = "\n\n".join(paragraphs[i] for i in sorted(selected + [index]))
-            if self.token_counter.count_tokens(candidate, model_name) <= target_tokens:
+            if self._count_tokens(candidate, model_name) <= target_tokens:
                 selected.append(index)
                 result = candidate
             elif not selected:
@@ -112,7 +128,7 @@ class ContextCompressor:
     async def _sliding_window_compression(self, context: str, target_tokens: int, model_name: str) -> str:
         """Keep head and tail around a compression marker within the budget."""
         marker = "\n...[COMPRESSED]...\n"
-        remaining = target_tokens - self.token_counter.count_tokens(marker, model_name)
+        remaining = target_tokens - self._count_tokens(marker, model_name)
         if remaining <= 0:
             return self._trim_to_token_budget(context, target_tokens, model_name)
         head = self._trim_to_token_budget(context, remaining // 2, model_name)
@@ -123,7 +139,7 @@ class ContextCompressor:
     def _trim_to_token_budget(self, text: str, budget: int, model_name: str,
                               suffix: str = "", keep_end: bool = False) -> str:
         """Find a fitting text slice with bounded search; include suffix in the count."""
-        count = self.token_counter.count_tokens
+        count = self._count_tokens
         if budget <= 0:
             return ""
         if count(text, model_name) <= budget:
@@ -231,9 +247,12 @@ class ResponseCache:
             logger.warning("Redis cache write failed: %s", exc)
 
     def generate_cache_key(self, request: QueryRequest, model_name: str) -> str:
-        """P2 MD5 of model:query:temperature:max_tokens; exclude user/attachments."""
-        value = f"{model_name}:{request.query}:{request.temperature}:{request.max_tokens}"
-        return hashlib.md5(value.encode("utf-8")).hexdigest()
+        """Hash exact generation inputs, including original context, into a fixed-size key."""
+        value = json.dumps(
+            [model_name, request.query, request.temperature, request.max_tokens, request.context],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 class BaseInferenceProvider(ABC):
     """Task 3.6 interface; no SDK clients are created by the framework."""
@@ -509,6 +528,9 @@ class InferenceEngine:
             try:
                 if await provider.initialize():
                     self.providers[name] = provider
+                    logger.info("Provider '%s' initialized successfully", name)
+                else:
+                    logger.warning("Provider '%s' unavailable; skipping", name)
             except Exception as exc:
                 logger.warning("Provider '%s' initialization failed; skipping: %s", name, exc)
 
@@ -519,8 +541,7 @@ class InferenceEngine:
         Errors become InferenceResponse(error=...), per P2.
         """
         start = perf_counter()
-        # P2 cache keys exclude context: bypass both reads and writes for contextual requests.
-        use_cache = self.cache.enabled and not request.context
+        use_cache = self.cache.enabled
         model_name = "unknown"
         error_type = None
         try:
@@ -531,16 +552,28 @@ class InferenceEngine:
                 cache_key = self.cache.generate_cache_key(request, model_name)
                 cached = await self.cache.get_cached_response(cache_key)
                 if cached is not None:
-                    return InferenceResponse(**{**cached, "cached": True})
+                    return InferenceResponse(**{
+                        **cached,
+                        "cached": True,
+                        "latency_ms": int((perf_counter() - start) * 1000),
+                    })
 
             compressed = False
             compressor = self.context_compressor
             if compressor.enabled and request.context:
+                original_context = request.context
                 context = await compressor.compress_context(request.context, model_name)
                 compressed = context != request.context
                 if compressed:
+                    original_tokens = compressor._count_tokens(original_context, model_name)
                     request = request.model_copy(update={"context": context})
-                    logger.info("Compressed context for model '%s'", model_name)
+                    logger.info(
+                        "Compressed context from %d to %d chars (%d to %d tokens) "
+                        "for model '%s' using '%s'",
+                        len(original_context), len(context), original_tokens,
+                        compressor._count_tokens(context, model_name), model_name,
+                        compressor.method,
+                    )
                     INFERENCE_METRICS.compressions_total.labels(method=compressor.method).inc()
 
             response = await self.batch_processor.add_request(request, provider, model_name)
@@ -608,8 +641,13 @@ class InferenceEngine:
 
     def get_health_status(self) -> Dict[str, Any]:
         """Aggregate provider health, enabled cache/compression and engine stats."""
+        providers = {
+            name: provider.get_health_status()
+            for name, provider in self.providers.items()
+        }
         return {
-            "providers": {name: provider.get_health_status() for name, provider in self.providers.items()},
+            "healthy": any(status.get("status") == "healthy" for status in providers.values()),
+            "providers": providers,
             "cache_enabled": self.cache.enabled,
             "compression_enabled": self.context_compressor.enabled,
             "inference_stats": dict(self.inference_stats),

@@ -51,8 +51,6 @@ class RoutingRule:
     weight: float = 1.0
 
     def matches(self, query_context: Dict[str, Any]) -> bool:
-        # P2 conditions come from trusted operator configuration. Disabling
-        # builtins does not make eval a sandbox for user-supplied expressions.
         try:
             return bool(
                 eval(
@@ -253,7 +251,6 @@ class QueryClassifier:
                 "probability", "integral", "determinant",
             ],
             QueryType.CODE_ANALYSIS: [
-                # 不放 fix / error：两者都已在 patterns 里，且 error 会误伤普通英文
                 "bug", "debug", "crash",
                 "refactor", "traceback", "segfault",
             ],
@@ -282,13 +279,10 @@ class QueryClassifier:
                 "evaluate", "trend", "correlation",
             ],
             QueryType.REASONING: [
-                # 不放 why：它在 patterns 第 1 条里，重复放会和 CODE_ANALYSIS 抢
-                # "why does this loop run so slowly" 这类查询
                 "rationale", "infer", "premise",
                 "deduce", "fallacy", "hypothesis",
             ],
             QueryType.QUESTION_ANSWERING: [
-                # 刻意不放 what / who / when / where —— 见上面原则 1
                 "definition", "meaning", "about",
                 "explain", "fact", "overview",
             ],

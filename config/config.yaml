@@ -23,7 +23,7 @@ logging:
 
 router:
   default_model: mistral-7b
-  routing_strategy: intelligent
+  routing_strategy: fallback
   models: 
     mistral-7b:
       provider: vllm
@@ -41,7 +41,7 @@ router:
     gpt-5.6-terra:
       provider: openai
       api_key_env: OPENAI_API_KEY
-      max_tokens: 128000
+      max_tokens: 5000
       cost_input_token: 2.0e-06
       cost_output_token: 1.2e-05
       priority: 2
@@ -56,7 +56,7 @@ router:
     claude-sonnet-5:
       provider: anthropic
       api_key_env: ANTHROPIC_API_KEY
-      max_tokens: 200000
+      max_tokens: 5000
       cost_input_token: 2.0e-06
       cost_output_token: 1.0e-05
       priority: 2

@@ -133,7 +133,6 @@ class ContextCompressor:
             return self._trim_to_token_budget(context, target_tokens, model_name)
         head = self._trim_to_token_budget(context, remaining // 2, model_name)
         tail = self._trim_to_token_budget(context, remaining - remaining // 2, model_name, keep_end=True)
-        # Joined text can tokenize differently from the individual pieces.
         return self._trim_to_token_budget(head + marker + tail, target_tokens, model_name)
 
     def _trim_to_token_budget(self, text: str, budget: int, model_name: str,
@@ -194,7 +193,7 @@ class ContextCompressor:
 
 
 class ResponseCache:
-    """P2 optional Redis cache using JSON values and expiring keys."""
+    """Redis cache using JSON values and expiring keys. Add context into key. """
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = dict(config)
@@ -204,7 +203,7 @@ class ResponseCache:
         self.redis_client = None
 
     async def initialize(self) -> None:
-        """If enabled, connect using host/port/db and ping; disable on failure."""
+        """disable on failure."""
         if not self.enabled:
             return
         try:
@@ -255,8 +254,6 @@ class ResponseCache:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 class BaseInferenceProvider(ABC):
-    """Task 3.6 interface; no SDK clients are created by the framework."""
-
     def __init__(self, config: Dict[str, Any], models: Dict[str, Any]) -> None:
         self.config = dict(config)
         # Reuse router ModelConfig input/output prices, rather than a second price table.
@@ -272,7 +269,6 @@ class BaseInferenceProvider(ABC):
 
     @abstractmethod
     def stream_response(self, request: QueryRequest, model_name: str) -> AsyncIterator[str]:
-        # Concrete providers implement this interface as async generators.
         raise NotImplementedError("Task 3.6: stream_response")
 
     @abstractmethod
@@ -282,7 +278,6 @@ class BaseInferenceProvider(ABC):
     def _token_cost(self, input_tokens: int, output_tokens: int, model_name: str) -> float:
         model = self.models.get(model_name)
         if model is None:
-            # P2 unknown-model estimate: reuse a configured model's prices.
             model = next(iter(self.models.values()), None)
             logger.warning("No configured price for '%s'; using provider fallback price", model_name)
         if model is None:
@@ -361,7 +356,9 @@ class OpenAIProvider(BaseInferenceProvider):
         return {"status": "healthy" if self.client is not None else "unhealthy"}
 
 class AnthropicProvider(BaseInferenceProvider):
-    """Anthropic async client; text blocks and separate input/output usage."""
+    """
+    Anthropic async client; text blocks and separate input/output usage
+    """
 
     def __init__(self, config: Dict[str, Any], models: Dict[str, Any]) -> None:
         super().__init__(config, models)
@@ -497,7 +494,6 @@ class BatchProcessor:
     async def add_request(
         self, request: QueryRequest, provider: BaseInferenceProvider, model_name: str
     ) -> InferenceResponse:
-        # P2 deliberately uses pass-through for both enabled states.
         return await provider.generate_response(request, model_name)
 
 

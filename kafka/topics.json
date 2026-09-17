@@ -1,32 +1,44 @@
 {
   "topics": [
     {
-      "name": "llm-router-queries",
-      "partitions": 3,
+      "name": "llm-queries",
+      "partitions": 6,
       "replication_factor": 1,
       "retention_ms": 604800000,
-      "compression_type": "gzip"
+      "cleanup_policy": "delete",
+      "description": "Query request entry log, generated 1 per POST /route"
     },
     {
-      "name": "llm-router-responses",
-      "partitions": 3,
+      "name": "llm-responses",
+      "partitions": 6,
       "replication_factor": 1,
       "retention_ms": 604800000,
-      "compression_type": "gzip"
+      "cleanup_policy": "delete",
+      "description": "Inference response details, including response_text and token/cost details"
     },
     {
-      "name": "llm-router-metrics",
-      "partitions": 3,
+      "name": "llm-metrics",
+      "partitions": 4,
       "replication_factor": 1,
       "retention_ms": 259200000,
-      "compression_type": "gzip"
+      "cleanup_policy": "delete",
+      "description": "System/model metric events, granularity 1 request generates 5~10 entries"
     },
     {
-      "name": "llm-router-errors",
-      "partitions": 3,
+      "name": "llm-errors",
+      "partitions": 4,
       "replication_factor": 1,
-      "retention_ms": 1209600000,
-      "compression_type": "gzip"
+      "retention_ms": 2592000000,
+      "cleanup_policy": "delete",
+      "description": "Error and exception events, including stacktrace, error_type"
+    },
+    {
+      "name": "llm-dead-letter",
+      "partitions": 2,
+      "replication_factor": 1,
+      "retention_ms": 2592000000,
+      "cleanup_policy": "delete",
+      "description": "Messages that failed ClickHouse write or consumption exceptions, for offline replay"
     }
   ]
 }

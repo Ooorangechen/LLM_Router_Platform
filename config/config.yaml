@@ -154,12 +154,14 @@ inference:
 kafka:
   enabled: false
   bootstrap_servers: localhost:9092
+  topics_file: kafka/topics.json
 
   topics:
-    queries: llm-router-queries
-    responses: llm-router-responses
-    metrics: llm-router-metrics
-    errors: llm-router-errors
+    queries: llm-queries
+    responses: llm-responses
+    metrics: llm-metrics
+    errors: llm-errors
+    dead_letter: llm-dead-letter
   
   producer:
     acks: all

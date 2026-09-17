@@ -284,12 +284,14 @@ inference:
 kafka:
   enabled: false
   bootstrap_servers: localhost:9092
+  topics_file: kafka/topics.json
 
   topics:
-    queries: llm-router-queries
-    responses: llm-router-responses
-    metrics: llm-router-metrics
-    errors: llm-router-errors
+    queries: llm-queries
+    responses: llm-responses
+    metrics: llm-metrics
+    errors: llm-errors
+    dead_letter: llm-dead-letter
   
   producer:
     acks: all
@@ -797,32 +799,44 @@ This file is a P1 placeholder and will be expanded in later phases.
 {
   "topics": [
     {
-      "name": "llm-router-queries",
-      "partitions": 3,
+      "name": "llm-queries",
+      "partitions": 6,
       "replication_factor": 1,
       "retention_ms": 604800000,
-      "compression_type": "gzip"
+      "cleanup_policy": "delete",
+      "description": "Query request entry log, generated 1 per POST /route"
     },
     {
-      "name": "llm-router-responses",
-      "partitions": 3,
+      "name": "llm-responses",
+      "partitions": 6,
       "replication_factor": 1,
       "retention_ms": 604800000,
-      "compression_type": "gzip"
+      "cleanup_policy": "delete",
+      "description": "Inference response details, including response_text and token/cost details"
     },
     {
-      "name": "llm-router-metrics",
-      "partitions": 3,
+      "name": "llm-metrics",
+      "partitions": 4,
       "replication_factor": 1,
       "retention_ms": 259200000,
-      "compression_type": "gzip"
+      "cleanup_policy": "delete",
+      "description": "System/model metric events, granularity 1 request generates 5~10 entries"
     },
     {
-      "name": "llm-router-errors",
-      "partitions": 3,
+      "name": "llm-errors",
+      "partitions": 4,
       "replication_factor": 1,
-      "retention_ms": 1209600000,
-      "compression_type": "gzip"
+      "retention_ms": 2592000000,
+      "cleanup_policy": "delete",
+      "description": "Error and exception events, including stacktrace, error_type"
+    },
+    {
+      "name": "llm-dead-letter",
+      "partitions": 2,
+      "replication_factor": 1,
+      "retention_ms": 2592000000,
+      "cleanup_policy": "delete",
+      "description": "Messages that failed ClickHouse write or consumption exceptions, for offline replay"
     }
   ]
 }

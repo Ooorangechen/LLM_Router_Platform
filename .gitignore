@@ -44,3 +44,7 @@ docker/volumes/
 .pytest_cache/
 .coverage
 htmlcov/
+
+
+AGENTS.md
+CLAUDE.md

@@ -392,6 +392,68 @@ def deploy(output_path):
         click.echo(f"Deploy failed: {exc}", err=True)
         sys.exit(1)
 
+async def _init_kafka_topics(config: dict) -> tuple[int, int]:
+    """Create missing metadata topics; return (created, already_existing)."""
+    from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+    from aiokafka.errors import TopicAlreadyExistsError
+    kafka_config = config["kafka"]
+    topics_path = Path(__file__).resolve().parent / kafka_config["topics_file"]
+    with topics_path.open(encoding="utf-8") as file:
+        topics = json.load(file)["topics"]
+
+    definitions = [
+        NewTopic(
+            name=item["name"],
+            num_partitions=item["partitions"],
+            replication_factor=kafka_config.get("replication_factor", item["replication_factor"]),
+            topic_configs={
+                "retention.ms": str(item["retention_ms"]),
+                "cleanup.policy": item["cleanup_policy"],
+            },
+        )
+        for item in topics
+    ]
+
+    admin = AIOKafkaAdminClient(
+        bootstrap_servers=kafka_config["bootstrap_servers"],
+        request_timeout_ms=10000,
+    )
+    try:
+        await admin.start()
+        existing_names = set(await admin.list_topics())
+        missing = [topic for topic in definitions if topic.name not in existing_names]
+        existing_count = len(definitions) - len(missing)
+        if not missing:
+            return 0, existing_count
+
+        response = await admin.create_topics(missing)
+        created_count = 0
+        for result in response.topic_errors:
+            name, error_code = result[:2]
+            if error_code == 0:
+                created_count += 1
+            elif error_code == TopicAlreadyExistsError.errno:
+                # Another process may have created it after list_topics().
+                existing_count += 1
+            else:
+                raise RuntimeError(f"Kafka topic creation failed: {name}, error_code={error_code}")
+        return created_count, existing_count
+    finally:
+        await admin.close()
+
+
+@cli.command(name="init-kafka-topics")
+@click.option("--config", "config_path", default=CONFIG_PATH, show_default=True)
+def init_kafka_topics(config_path):
+    """Create Kafka topics defined in topics.json without starting app services."""
+    try:
+        platform = LLMRouterPlatform(config_path)
+        created, existing = asyncio.run(
+            _init_kafka_topics(platform.config)
+        )
+        click.echo(f"Created {created} topics; {existing} already exist.")
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
 
 if __name__ == "__main__":
     cli()

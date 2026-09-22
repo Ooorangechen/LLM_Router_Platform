@@ -167,7 +167,7 @@ class RoutingDecision(BaseModel):
     routing_reason: str = Field(min_length=1)
 
     # metrics
-    token_count: int = Field(ge=0)
+    token_count: int = Field(ge=0) # pre-inference estimate token count 
     estimated_cost: float = Field(ge=0.0)
     routing_time_ms: int = Field(ge=0)
     confidence: float = Field(ge=0.0, le=1.0)

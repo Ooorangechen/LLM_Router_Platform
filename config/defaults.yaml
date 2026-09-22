@@ -152,7 +152,6 @@ inference:
     max_wait_time_ms: 50
   
 kafka:
-  enabled: false
   bootstrap_servers: localhost:9092
   topics_file: kafka/topics.json
 
@@ -167,14 +166,19 @@ kafka:
     acks: all
     retries: 3
     batch_size: 16384
-    linger_ms: 10
+    linger_ms: 5
     compression_type: gzip
+    request_timeout_ms: 30000
+    enable_idempotence: true
   
   consumer:
-    group_id: llm-router-consumer-group
+    group_id: llm-router-clickhouse-consumer
     auto_offset_reset: earliest
-    enable_auto_commit: true
     max_poll_records: 500
+    max_poll_interval_ms: 300000
+    enable_auto_commit: false
+    fetch_min_bytes: 1024
+    fetch_max_wait_ms: 500
 
 clickhouse:
   enabled: false

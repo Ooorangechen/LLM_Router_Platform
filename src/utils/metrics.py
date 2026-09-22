@@ -202,6 +202,10 @@ class PipelineMetrics:
                                   "Pipeline consumer lag",
                                   labelnames=["topic", "partition"])
 
+        self.kafka_produce_total = Counter(
+            "pipeline_kafka_produce_total",
+            "Kafka produce attempts by topic and status",
+            labelnames=["topic", "status"],)
 
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()

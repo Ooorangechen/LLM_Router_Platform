@@ -167,8 +167,10 @@ kafka:
     acks: all
     retries: 3
     batch_size: 16384
-    linger_ms: 10
+    linger_ms: 5
     compression_type: gzip
+    request_timeout_ms: 30000
+    enable_idempotence: true
   
   consumer:
     group_id: llm-router-consumer-group

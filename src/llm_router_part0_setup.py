@@ -282,7 +282,6 @@ inference:
     max_wait_time_ms: 50
   
 kafka:
-  enabled: false
   bootstrap_servers: localhost:9092
   topics_file: kafka/topics.json
 
@@ -297,28 +296,33 @@ kafka:
     acks: all
     retries: 3
     batch_size: 16384
-    linger_ms: 10
+    linger_ms: 5
     compression_type: gzip
+    request_timeout_ms: 30000
+    enable_idempotence: true
   
   consumer:
-    group_id: llm-router-consumer-group
+    group_id: llm-router-clickhouse-consumer
     auto_offset_reset: earliest
-    enable_auto_commit: true
     max_poll_records: 500
+    max_poll_interval_ms: 300000
+    enable_auto_commit: false
+    fetch_min_bytes: 1024
+    fetch_max_wait_ms: 500
 
 clickhouse:
-  enabled: false
   host: localhost
   port: 8123
-  database: llm_router
+  native_port: 9000
   username: default
-  password_env: CLICKHOUSE_PASSWORD
-
-  tables:
-    query_logs: query_logs
-    system_metrics: system_metrics
-    model_performance: model_performance
-    user_analytics: user_analytics
+  password: ""
+  database: default
+  schema_file: clickhouse/schema.sql
+  batch_size: 200
+  retry_max: 3
+  retry_backoff_base_ms: 1000
+  connection_timeout_sec: 10
+  send_receive_timeout_sec: 300
 
 monitoring:
   enabled: false
@@ -844,75 +848,8 @@ This file is a P1 placeholder and will be expanded in later phases.
 
     @staticmethod
     def _template_clickhouse_schema() -> str:
-        return """\
--- P1 template, activated in P3
-
-CREATE TABLE IF NOT EXISTS query_logs (
-    request_id String,
-    user_id String,
-    user_tier String,
-    query_type String,
-    model_name String,
-    provider String,
-    input_tokens UInt32,
-    output_tokens UInt32,
-    latency_ms Float64,
-    cost_usd Float64,
-    status String,
-    timestamp DateTime
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (timestamp, user_id);
-
-CREATE TABLE IF NOT EXISTS system_metrics (
-    name String,
-    value Float64,
-    labels String,
-    timestamp DateTime
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (timestamp, name);
-
-CREATE TABLE IF NOT EXISTS model_performance (
-    model_name String,
-    provider String,
-    tokens_per_second Float64,
-    quality_score Float64,
-    error_rate Float64,
-    timestamp DateTime
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (timestamp, model_name);
-
-CREATE TABLE IF NOT EXISTS user_analytics (
-    user_id String,
-    user_tier String,
-    total_requests UInt64,
-    total_tokens UInt64,
-    total_cost_usd Float64,
-    date Date
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(date)
-ORDER BY (date, user_id);
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS hourly_metrics
-ENGINE = SummingMergeTree()
-ORDER BY (hour, model_name)
-AS
-SELECT
-    toStartOfHour(timestamp) AS hour,
-    model_name,
-    count() AS request_count,
-    sum(cost_usd) AS total_cost_usd,
-    sum(input_tokens + output_tokens) AS total_tokens
-FROM query_logs
-GROUP BY hour, model_name;
-
--- bloom filter indexes for the three highest cardinality lookup columns
-ALTER TABLE query_logs ADD INDEX IF NOT EXISTS idx_user_id user_id TYPE bloom_filter GRANULARITY 4;
-ALTER TABLE query_logs ADD INDEX IF NOT EXISTS idx_model_name model_name TYPE bloom_filter GRANULARITY 4;
-ALTER TABLE query_logs ADD INDEX IF NOT EXISTS idx_query_type query_type TYPE bloom_filter GRANULARITY 4;
-"""
+        schema_path = Path(__file__).resolve().parents[1] / "clickhouse/schema.sql"
+        return schema_path.read_text(encoding="utf-8")
 
     @staticmethod
     def _template_prometheus() -> str:

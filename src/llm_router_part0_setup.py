@@ -48,18 +48,21 @@ REQUIRED_DIRS = [
 # python package directories that additionally need an empty __init__.py
 PACKAGE_DIRS = ["src", "src/models", "src/utils", "tests"]
 
-DEFAULTS_CONFIG_REL_PATH = "config/defaults.yaml"
 CONFIG_REL_PATH = "config/config.yaml"
 
 # 3.1.4 key files that must exist once setup finishes
 KEY_FILES = [
-    DEFAULTS_CONFIG_REL_PATH,
     CONFIG_REL_PATH,
     "requirements.txt",
 ]
 
-# 3.1.4 sections required in both generated configuration files
-EXPECTED_SECTIONS = ["api", "router", "inference", "kafka", "monitoring"]
+# Sections required in the canonical platform configuration.
+EXPECTED_SECTIONS = [
+    "api", "logging", "router", "inference", "kafka", "clickhouse",
+    "monitoring", "slack", "streamlit", "flink", "security", "performance",
+    "development", "features", "pipeline", "adapters", "policies",
+    "optimization", "quality", "router_mode",
+]
 
 
 REQUIREMENTS_TEMPLATE = """\
@@ -76,6 +79,7 @@ pydantic-settings>=2.1
 
 # 配置文件格式
 pyyaml>=6.0
+python-dotenv>=1.0
 
 # 结构化日志
 structlog>=23.2
@@ -124,12 +128,22 @@ pytest-asyncio>=0.21
 black>=23.0
 flake8>=6.0
 mypy>=1.7
+
+# Encoders
+tiktoken>=0.14.0
+
+# LLM Provider SDK
+openai>=1.12
+anthropic>=0.18
+
+# 重试策略
+tenacity>=8.2
 """
 
 
 CONFIG_TEMPLATE = """\
-# One-truth-source, default configs
-# has the complete default structure
+## 全平台配置文件，按section分层
+## api / logging / router / ...
 api:
   host: "0.0.0.0"
   port: 8080
@@ -171,7 +185,7 @@ router:
     gpt-5.6-terra:
       provider: openai
       api_key_env: OPENAI_API_KEY
-      max_tokens: 128000
+      max_tokens: 5000
       cost_input_token: 2.0e-06
       cost_output_token: 1.2e-05
       priority: 2
@@ -186,7 +200,7 @@ router:
     claude-sonnet-5:
       provider: anthropic
       api_key_env: ANTHROPIC_API_KEY
-      max_tokens: 200000
+      max_tokens: 5000
       cost_input_token: 2.0e-06
       cost_output_token: 1.0e-05
       priority: 2
@@ -264,12 +278,12 @@ inference:
     timeout: 60
     retries: 3
   compression:
-    enabled: false
-    max_context_tokens: 6000
+    enabled: true
+    max_context_tokens: 100000
     compression_ratio: 0.3
     method: semantic_graph
   cache:
-    enabled: false
+    enabled: true
     backend: redis
     host: localhost
     port: 6379
@@ -277,13 +291,14 @@ inference:
     ttl: 3600
     max_size: 10000
   batching:
-    enabled: false
+    enabled: true
     max_batch_size: 32
     max_wait_time_ms: 50
   
 kafka:
   bootstrap_servers: localhost:9092
   topics_file: kafka/topics.json
+  replication_factor: 1
 
   topics:
     queries: llm-queries
@@ -299,6 +314,7 @@ kafka:
     linger_ms: 5
     compression_type: gzip
     request_timeout_ms: 30000
+    max_in_flight: 5
     enable_idempotence: true
   
   consumer:
@@ -315,7 +331,7 @@ clickhouse:
   port: 8123
   native_port: 9000
   username: default
-  password: ""
+  password_env: CLICKHOUSE_PASSWORD
   database: default
   schema_file: clickhouse/schema.sql
   batch_size: 200
@@ -323,6 +339,12 @@ clickhouse:
   retry_backoff_base_ms: 1000
   connection_timeout_sec: 10
   send_receive_timeout_sec: 300
+
+  tables:
+    query_logs: query_logs
+    system_metrics: system_metrics
+    model_performance: model_performance
+    user_analytics: user_analytics
 
 monitoring:
   enabled: false
@@ -366,7 +388,7 @@ slack:
     rpm: 20
 
 streamlit:
-  enabled: false
+  enabled: true
   port: 8501
   host: "0.0.0.0"
 
@@ -381,6 +403,8 @@ streamlit:
   
 flink:
   enabled: false
+  job_name: LLM Router Analytics
+  checkpoint_dir: data/flink-checkpoints
   job_manager:
     host: localhost
     port: 8081
@@ -441,6 +465,10 @@ features:
 
 pipeline:
   enabled: false
+  async_publish: true
+  dlq_local_dir: data/dlq
+  flush_interval_ms: 5000
+  metrics_report_interval_ms: 10000
 
 adapters:
   enabled: false
@@ -495,7 +523,7 @@ optimization:
   enabled: false
   kv_cache_size_gb: 8
   max_batch_size: 32
-  max_wait_seconds: 0.1
+  max_wait_ms: 100
   flash_attn: true
   tensorrt: false
 
@@ -516,7 +544,8 @@ quality:
   health_check_interval_seconds: 30
 
 router_mode:
-  use_integrated_router: false"""
+  use_integrated_router: false
+"""
 
 
 class _PrintLogger:
@@ -564,7 +593,6 @@ class ProjectSetup:
 
         self._create_directories()
         self._create_files()
-        self._create_defaults_config_file()
         self._create_config_file()
 
         if install_deps:
@@ -616,15 +644,8 @@ class ProjectSetup:
 
     # --------------------------------------------------------- 3. config
 
-    def _create_defaults_config_file(self) -> None:
-        """Regenerate defaults.yaml from the canonical setup template every time."""
-        defaults_path = self.project_root / DEFAULTS_CONFIG_REL_PATH
-        defaults_path.parent.mkdir(parents=True, exist_ok=True)
-        defaults_path.write_text(self._template_config_yaml(), encoding="utf-8")
-        self.logger.info(f"Default config generated: {DEFAULTS_CONFIG_REL_PATH}")
-
     def _create_config_file(self) -> None:
-        """Initialize config.yaml from the same template without overwriting user edits."""
+        """Initialize the canonical config without overwriting user edits."""
         config_path = self.project_root / CONFIG_REL_PATH
 
         if config_path.exists():
@@ -683,23 +704,24 @@ class ProjectSetup:
         self.logger.info("Directory and key file validation passed")
 
     def _validate_config(self) -> None:
-        for rel_path in (DEFAULTS_CONFIG_REL_PATH, CONFIG_REL_PATH):
-            config_path = self.project_root / rel_path
+        config_path = self.project_root / CONFIG_REL_PATH
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"{CONFIG_REL_PATH} is not valid YAML: {exc}") from exc
 
-            try:
-                with config_path.open("r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f) or {}
-            except yaml.YAMLError as exc:
-                raise ValueError(f"{rel_path} is not valid YAML: {exc}") from exc
+        if not isinstance(config, dict):
+            raise ValueError(
+                f"{CONFIG_REL_PATH} must contain a top-level YAML mapping")
 
-            if not isinstance(config, dict):
-                raise ValueError(f"{rel_path} must contain a top-level YAML mapping")
+        missing = [name for name in EXPECTED_SECTIONS if name not in config]
+        if missing:
+            raise ValueError(
+                f"{CONFIG_REL_PATH} is missing required sections: {missing}")
 
-            missing = [name for name in EXPECTED_SECTIONS if name not in config]
-            if missing:
-                raise ValueError(f"{rel_path} is missing required sections: {missing}")
-
-            self.logger.info(f"Configuration structure validation passed: {rel_path}")
+        self.logger.info(
+            f"Configuration structure validation passed: {CONFIG_REL_PATH}")
 
     # ------------------------------------------------------- templates
 
@@ -759,17 +781,19 @@ htmlcov/
         return """\
 # LLM Router & Execution Platform
 
-A multi-model LLM routing and execution platform. It exposes one entry point for
-OpenAI, Anthropic and self-hosted vLLM backends, and adds routing decisions,
-end-to-end observability and multi-tenant governance on top.
+A multi-model routing and inference platform for OpenAI, Anthropic and
+self-hosted vLLM backends, with optional Kafka and ClickHouse persistence.
 
 ## Quick start
 
 ```bash
-python main.py setup    # create directories, templates and dependencies
-python main.py start    # start the service, default http://localhost:8080
-python main.py health   # check service health
+python main.py setup
+python main.py start
+python main.py health
 ```
+
+`config/config.yaml` is the complete platform configuration. Pass a partial
+override with `python main.py start --config path/to/override.yaml`.
 
 ## CLI commands
 
@@ -779,12 +803,11 @@ python main.py health   # check service health
 | `start` | Run the platform, add `--dev` for auto reload |
 | `health` | Query `/health` of a running instance |
 | `deploy` | Generate deployment artifacts (P1 stub) |
+| `init-kafka-topics` | Create missing Kafka topics from metadata |
 
 ## Layout
 
-See section 4.2 of `docs/P1.md` for the module breakdown.
-
-This file is a P1 placeholder and will be expanded in later phases.
+See `docs/P1.md`, `docs/P2.md`, and `docs/P3.md` for the phased architecture.
 """
 
     @staticmethod
@@ -1063,6 +1086,5 @@ if __name__ == "__main__":
     for name in setup.required_files:
         print(f"  {name}")
 
-    print(f"default config template: {DEFAULTS_CONFIG_REL_PATH}")
-    print(f"user config template: {CONFIG_REL_PATH}")
+    print(f"platform config template: {CONFIG_REL_PATH}")
     print("Dry run only, call setup_project_environment() to apply.")

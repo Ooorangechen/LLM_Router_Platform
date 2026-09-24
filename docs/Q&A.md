@@ -177,26 +177,13 @@ config = yaml.safe_load(f) or {}
 
 也就是：不是三份手写, 而是 一份唯一真源,  setup 和 _load_config() 都基于这份真源工作
 
-可以把配置职责拆成这样：
+当前实现把配置职责拆成这样：
 
-- config/defaults.yaml
-  
-  - 唯一真源
-  - 放完整默认结构
-- config/config.yaml
-  
-  - 用户覆盖项
-  - 可以是完整文件，也可以只写差异项
-- _load_config()
-  
-  - 先读 defaults.yaml
-  - 再读 config.yaml
-  - 做递归 deep merge
-  - 返回最终运行时配置
-  这样之后：
-- setup 只需要把 defaults.yaml 落盘
-- config.yaml 可以初始化成 defaults 的副本，或者初始化成一个 override 示例
-- main.py 不再手写一堆 setdefault()
+- `config/config.yaml` 是唯一的运行时配置基线，包含所有 section 与默认值；
+- setup 保留一份硬编码 bootstrap 模板，因此即使 `config.yaml` 尚不存在也能创建它；
+- 如果 `config.yaml` 已存在，setup 不覆盖或同步它，以现存配置为准；
+- `_load_config()` 默认直接读取基线，传入自定义配置时将其作为局部覆盖层递归合并；
+- main.py 不再手写第三套 `setdefault()` 默认字典，也不再维护 `defaults.yaml`。
 
 
 
@@ -227,6 +214,3 @@ config = yaml.safe_load(f) or {}
 ```
 
 是，应该增加到 config.yaml 里面
-
-
-

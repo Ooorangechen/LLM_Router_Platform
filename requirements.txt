@@ -62,7 +62,7 @@ flake8>=6.0
 mypy>=1.7
 
 # Encoders
-tiktoken >= 0.14.0
+tiktoken>=0.14.0
 
 # LLM Provider SDK
 openai>=1.12

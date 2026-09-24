@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import time
 import traceback
 from pathlib import Path
@@ -10,7 +12,7 @@ from src.utils.schema import RoutingDecision, InferenceResponse, QueryRequest
 from src.utils.metrics import PIPELINE_METRICS
 import asyncio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from src.utils.constants import KafkaTopics
+from src.utils.constants import ClickHouseTables, KafkaTopics
 from src.utils.logger import get_logger
 
 # Decision: import clickhouse_connect optionally. P3 lists it as a hard
@@ -248,11 +250,21 @@ class KafkaProducerManager:
 
         kafka_config = config.get("kafka", {})
         producer_config = kafka_config.get("producer", {})
+        configured_topics = kafka_config.get("topics", {})
+        self.topics = {
+            topic.name.lower(): configured_topics.get(
+                topic.name.lower(), topic.value
+            )
+            for topic in KafkaTopics
+        }
         self.bootstrap_servers = kafka_config.get(
             "bootstrap_servers", "localhost:9092")
         # aiokafka has no `retries` option, so P3's kafka.producer.retries is
         # spent on connection attempts in initialize() instead.
         self.max_attempts = int(producer_config.get("retries", 3))
+        # aiokafka does not expose a max-in-flight constructor argument. Keep
+        # the resolved P3 setting for producer backends that support it.
+        self.max_in_flight = int(producer_config.get("max_in_flight", 5))
         self.producer_options = {
             "bootstrap_servers": self.bootstrap_servers,
             "acks": producer_config.get("acks", "all"),
@@ -380,6 +392,13 @@ class KafkaConsumerEngine:
 
         kafka_config = config.get("kafka", {})
         consumer_config = kafka_config.get("consumer", {})
+        configured_topics = kafka_config.get("topics", {})
+        self.topic_names = {
+            topic.name.lower(): configured_topics.get(
+                topic.name.lower(), topic.value
+            )
+            for topic in KafkaTopics
+        }
 
         self.bootstrap_servers = kafka_config.get(
             "bootstrap_servers", "localhost:9092")
@@ -394,8 +413,19 @@ class KafkaConsumerEngine:
         self.fetch_max_wait_ms = consumer_config.get("fetch_max_wait_ms", 500)
 
         # Business topics only: consuming the DLQ topic loops failures back here.
-        self.topics = [KafkaTopics.QUERIES.value, KafkaTopics.RESPONSES.value,
-                       KafkaTopics.METRICS.value, KafkaTopics.ERRORS.value]
+        self.topics = [
+            self.topic_names["queries"],
+            self.topic_names["responses"],
+            self.topic_names["metrics"],
+            self.topic_names["errors"],
+        ]
+        configured_tables = config.get("clickhouse", {}).get("tables", {})
+        self.table_names = {
+            table.name.lower(): configured_tables.get(
+                table.name.lower(), table.value
+            )
+            for table in ClickHouseTables
+        }
         # A query and its response arrive as separate events; hold the first
         # half until its partner lands so query_logs gets one complete row.
         self._pending: Dict[str, Dict[str, Any]] = {}
@@ -484,14 +514,14 @@ class KafkaConsumerEngine:
         try:
             payload = json.loads(msg_value.decode("utf-8"))
 
-            if topic == KafkaTopics.METRICS.value:
-                table = "system_metrics"
+            if topic == self.topic_names["metrics"]:
+                table = self.table_names["system_metrics"]
                 row = {**payload,
                        "timestamp": _ch_datetime(payload["timestamp"])}
 
-            elif topic == KafkaTopics.ERRORS.value:
+            elif topic == self.topic_names["errors"]:
                 # schema.sql has no error table, so an error becomes a metric row.
-                table = "system_metrics"
+                table = self.table_names["system_metrics"]
                 row = {"timestamp": _ch_datetime(payload["timestamp"]),
                        "service": "llm-router", "metric_name": "error_event",
                        "value": 1.0,
@@ -500,14 +530,16 @@ class KafkaConsumerEngine:
                                   "component": payload["component"],
                                   "severity": payload["severity"]}}
 
-            elif topic in (KafkaTopics.QUERIES.value, KafkaTopics.RESPONSES.value):
-                table = "query_logs"
+            elif topic in (
+                    self.topic_names["queries"],
+                    self.topic_names["responses"]):
+                table = self.table_names["query_logs"]
                 other = self._pending.pop(payload["query_id"], None)
                 if other is None:
                     self._pending[payload["query_id"]] = payload
                     return None                      # half a row; wait
                 query, response = ((payload, other)
-                                   if topic == KafkaTopics.QUERIES.value
+                                   if topic == self.topic_names["queries"]
                                    else (other, payload))
                 # Entry field names are the query_logs column names, so the two
                 # halves merge directly; response wins on status and on
@@ -573,7 +605,9 @@ class ClickHouseWriter:
         self.host = clickhouse_config.get("host", "localhost")
         self.port = clickhouse_config.get("port", 8123)
         self.username = clickhouse_config.get("username", "default")
-        self.password = clickhouse_config.get("password", "")
+        password_env = clickhouse_config.get(
+            "password_env", "CLICKHOUSE_PASSWORD")
+        self.password = os.getenv(password_env, "")
         self.database = clickhouse_config.get("database", "default")
         self.schema_file = Path(clickhouse_config.get(
             "schema_file", "clickhouse/schema.sql"))
@@ -589,10 +623,23 @@ class ClickHouseWriter:
         # Allowed tables come from config; the defaults are the four tables in
         # clickhouse/schema.sql. The table name is interpolated into SQL, so it
         # must never come from message content.
-        self.tables = set(clickhouse_config.get("tables", {}).values()) or {
-            "query_logs", "system_metrics",
-            "model_performance", "user_analytics",
+        configured_tables = clickhouse_config.get("tables", {})
+        self.table_names = {
+            table.name.lower(): configured_tables.get(
+                table.name.lower(), table.value)
+            for table in ClickHouseTables
         }
+        invalid_tables = [
+            name for name in self.table_names.values()
+            if not isinstance(name, str)
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+        ]
+        if invalid_tables:
+            raise ValueError(
+                f"Invalid ClickHouse table names: {invalid_tables}")
+        self.tables = set(self.table_names.values())
+        if len(self.tables) != len(self.table_names):
+            raise ValueError("ClickHouse table names must be unique")
 
         self.client: Optional[Any] = None
         self._buffers: Dict[str, List[Dict[str, Any]]] = {}
@@ -643,6 +690,16 @@ class ClickHouseWriter:
         except Exception as e:
             self.logger.warning("ClickHouse schema file unreadable: %s", e)
             return
+
+        # The bundled schema uses enum defaults. Rewrite identifiers so table
+        # overrides also apply to CREATE TABLE and materialized-view references.
+        for table in ClickHouseTables:
+            resolved_name = self.table_names[table.name.lower()]
+            sql_text = re.sub(
+                rf"\b{re.escape(table.value)}\b",
+                resolved_name,
+                sql_text,
+            )
 
         statements = []
         for part in sql_text.split(";"):

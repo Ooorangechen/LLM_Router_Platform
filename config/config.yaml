@@ -23,7 +23,7 @@ logging:
 
 router:
   default_model: mistral-7b
-  routing_strategy: fallback
+  routing_strategy: intelligent
   models: 
     mistral-7b:
       provider: vllm
@@ -135,7 +135,7 @@ inference:
     retries: 3
   compression:
     enabled: true
-    max_context_tokens: 6000
+    max_context_tokens: 100000
     compression_ratio: 0.3
     method: semantic_graph
   cache:
@@ -147,14 +147,14 @@ inference:
     ttl: 3600
     max_size: 10000
   batching:
-    enabled: false
+    enabled: true
     max_batch_size: 32
     max_wait_time_ms: 50
   
 kafka:
-  enabled: false
   bootstrap_servers: localhost:9092
   topics_file: kafka/topics.json
+  replication_factor: 1
 
   topics:
     queries: llm-queries
@@ -170,21 +170,31 @@ kafka:
     linger_ms: 5
     compression_type: gzip
     request_timeout_ms: 30000
+    max_in_flight: 5
     enable_idempotence: true
   
   consumer:
-    group_id: llm-router-consumer-group
+    group_id: llm-router-clickhouse-consumer
     auto_offset_reset: earliest
-    enable_auto_commit: true
     max_poll_records: 500
+    max_poll_interval_ms: 300000
+    enable_auto_commit: false
+    fetch_min_bytes: 1024
+    fetch_max_wait_ms: 500
 
 clickhouse:
-  enabled: false
   host: localhost
   port: 8123
-  database: llm_router
+  native_port: 9000
   username: default
   password_env: CLICKHOUSE_PASSWORD
+  database: default
+  schema_file: clickhouse/schema.sql
+  batch_size: 200
+  retry_max: 3
+  retry_backoff_base_ms: 1000
+  connection_timeout_sec: 10
+  send_receive_timeout_sec: 300
 
   tables:
     query_logs: query_logs
@@ -234,7 +244,7 @@ slack:
     rpm: 20
 
 streamlit:
-  enabled: false
+  enabled: true
   port: 8501
   host: "0.0.0.0"
 
@@ -249,6 +259,8 @@ streamlit:
   
 flink:
   enabled: false
+  job_name: LLM Router Analytics
+  checkpoint_dir: data/flink-checkpoints
   job_manager:
     host: localhost
     port: 8081
@@ -309,6 +321,10 @@ features:
 
 pipeline:
   enabled: false
+  async_publish: true
+  dlq_local_dir: data/dlq
+  flush_interval_ms: 5000
+  metrics_report_interval_ms: 10000
 
 adapters:
   enabled: false
@@ -363,7 +379,7 @@ optimization:
   enabled: false
   kv_cache_size_gb: 8
   max_batch_size: 32
-  max_wait_seconds: 0.1
+  max_wait_ms: 100
   flash_attn: true
   tensorrt: false
 

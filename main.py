@@ -6,6 +6,7 @@ import signal
 import asyncio
 from pathlib import Path
 from copy import deepcopy
+from typing import Union
 import click
 import yaml
 from dotenv import load_dotenv
@@ -14,11 +15,12 @@ from src.llm_router_part0_setup import setup_project_environment
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
 from src.utils.logger import setup_logging, get_logger
+from src.utils.constants import KafkaTopics
 from src.utils.schema import QueryRequest, UserTier
 import src.utils.metrics  
 
-DEFAULTS_CONFIG_PATH = "config/defaults.yaml"
-CONFIG_PATH = "config/config.yaml"
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = str(PROJECT_ROOT / "config/config.yaml")
 
 
 try:
@@ -36,9 +38,8 @@ class LLMRouterPlatform:
         initializeing service structure
     """
 
-    def __init__(self, config_path: str = CONFIG_PATH, defaults_config_path: str = DEFAULTS_CONFIG_PATH,):
-        self.config_path = Path(config_path)
-        self.defaults_config_path = Path(defaults_config_path)
+    def __init__(self, config_path: Union[str, Path] = CONFIG_PATH):
+        self.config_path = Path(config_path).resolve()
         load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
         self.config = self._load_config()
         self.services = {}
@@ -47,16 +48,14 @@ class LLMRouterPlatform:
 
     def _load_config(self) -> dict:
         """
-        Load canonical defaults, then recursively apply user overrides.
+        Load the platform config, then recursively apply an optional override.
         """
-        defaults = self._read_yaml_mapping(
-            self.defaults_config_path
-        )
-        overrides = self._read_yaml_mapping(
-            self.config_path
-        )
-
-        return self._deep_merge(defaults, overrides)
+        canonical_path = Path(CONFIG_PATH).resolve()
+        canonical = self._read_yaml_mapping(canonical_path)
+        if self.config_path == canonical_path:
+            return canonical
+        overrides = self._read_yaml_mapping(self.config_path)
+        return self._deep_merge(canonical, overrides)
 
     @staticmethod
     def _read_yaml_mapping(path: Path) -> dict:
@@ -400,10 +399,15 @@ async def _init_kafka_topics(config: dict) -> tuple[int, int]:
     topics_path = Path(__file__).resolve().parent / kafka_config["topics_file"]
     with topics_path.open(encoding="utf-8") as file:
         topics = json.load(file)["topics"]
+    configured_names = kafka_config.get("topics", {})
+    logical_keys = {topic.value: topic.name.lower() for topic in KafkaTopics}
 
     definitions = [
         NewTopic(
-            name=item["name"],
+            name=configured_names.get(
+                logical_keys.get(item["name"], item["name"]),
+                item["name"],
+            ),
             num_partitions=item["partitions"],
             replication_factor=kafka_config.get("replication_factor", item["replication_factor"]),
             topic_configs={

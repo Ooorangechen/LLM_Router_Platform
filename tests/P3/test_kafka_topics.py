@@ -86,6 +86,23 @@ async def test_partial_existing_and_replication_override(topic_config, broker):
 
 
 @pytest.mark.asyncio
+async def test_topic_provisioning_uses_configured_names(topic_config, broker):
+    topic_config["kafka"]["topics"] = {
+        "queries": "tenant-queries",
+        "responses": "tenant-responses",
+        "metrics": "tenant-metrics",
+        "errors": "tenant-errors",
+        "dead_letter": "tenant-dead-letter",
+    }
+
+    assert await main._init_kafka_topics(topic_config) == (5, 0)
+    assert {topic.name for topic in broker.created} == {
+        "tenant-queries", "tenant-responses", "tenant-metrics",
+        "tenant-errors", "tenant-dead-letter",
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("version", [0, 3])
 async def test_concurrent_creation_already_exists_is_success(topic_config, broker, version):
     broker.error_code = 36

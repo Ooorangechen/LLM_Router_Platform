@@ -5,8 +5,8 @@ import time
 import traceback
 from pathlib import Path
 from uuid import UUID, uuid4
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List, Dict, Any, Tuple, Literal
+from pydantic import AfterValidator, BaseModel, Field
+from typing import Annotated, Optional, List, Dict, Any, Tuple, Literal
 from datetime import datetime, timezone, timedelta
 from src.utils.schema import RoutingDecision, InferenceResponse, QueryRequest
 from src.utils.metrics import PIPELINE_METRICS
@@ -28,10 +28,13 @@ except ImportError:
 ##### New Pydantic Models
 
 def _as_utc(value: datetime) -> datetime:
-    """Return an aware UTC datetime, treating legacy naive values as UTC."""
+    """Normalize one datetime at an external data boundary."""
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+UTCDateTime = Annotated[datetime, AfterValidator(_as_utc)]
 
 class QueryLogEntry(BaseModel):
     query_id: UUID
@@ -50,15 +53,10 @@ class QueryLogEntry(BaseModel):
     max_tokens: int = Field(ge=1)
     has_context: bool 
     has_attachments: bool
-    request_received_at: datetime
+    request_received_at: UTCDateTime
 
     status: Literal["received"] = "received"
     extra_labels: Dict[str, str] = Field(default_factory=dict)
-
-    @field_validator("request_received_at")
-    @classmethod
-    def normalize_timestamp(cls, value: datetime) -> datetime:
-        return _as_utc(value)
 
 class ResponseLogEntry(BaseModel):
     query_id: UUID
@@ -81,26 +79,16 @@ class ResponseLogEntry(BaseModel):
 
     error: Optional[str] = None
 
-    response_completed_at: datetime
+    response_completed_at: UTCDateTime
 
     status: Literal["success", "error"]
 
-    @field_validator("response_completed_at")
-    @classmethod
-    def normalize_timestamp(cls, value: datetime) -> datetime:
-        return _as_utc(value)
-
 class MetricEntry(BaseModel):
-    timestamp: datetime
+    timestamp: UTCDateTime
     service: str = "llm-router"
     metric_name: str = Field(min_length=1)
     value: float 
     labels: Dict[str, str]
-
-    @field_validator("timestamp")
-    @classmethod
-    def normalize_timestamp(cls, value: datetime) -> datetime:
-        return _as_utc(value)
 
 class ErrorEntry(BaseModel):
     error_id: UUID = Field(default_factory=uuid4)
@@ -110,13 +98,8 @@ class ErrorEntry(BaseModel):
     stacktrace: str
     component: str = Field(min_length=1)
     severity: Literal["warning", "error", "critical"] = "error"
-    timestamp: datetime
+    timestamp: UTCDateTime
     extra: Dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("timestamp")
-    @classmethod
-    def normalize_timestamp(cls, value: datetime) -> datetime:
-        return _as_utc(value)
 
 class DeadLetterEntry(BaseModel):
     """encapsulates messages that failed to write"""
@@ -126,13 +109,8 @@ class DeadLetterEntry(BaseModel):
     original_message: str
     failure_reason: str
     failure_count: int = Field(ge=1)
-    first_failed_at: datetime
-    last_failed_at: datetime
-
-    @field_validator("first_failed_at", "last_failed_at")
-    @classmethod
-    def normalize_timestamps(cls, value: datetime) -> datetime:
-        return _as_utc(value)
+    first_failed_at: UTCDateTime
+    last_failed_at: UTCDateTime
 
 
 #### Factory functions
@@ -889,3 +867,91 @@ class ClickHouseWriter:
         finally:
             self.client = None
             self.enabled = False
+
+
+class PipelineManager:
+    """Minimal composition layer for publishing and persisting P3 events."""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.logger = get_logger("pipeline")
+        self.enabled = config.get("pipeline", {}).get("enabled", False)
+        self.producer = KafkaProducerManager(config)
+        self.writer = ClickHouseWriter(config)
+        self.consumer = KafkaConsumerEngine(config, self.writer)
+
+    async def initialize(self) -> None:
+        if not self.enabled:
+            return
+        await self.writer.initialize()
+        await self.producer.initialize()
+        if self.writer.enabled:
+            await self.consumer.initialize()
+        else:
+            self.consumer.enabled = False
+            self.logger.warning(
+                "Kafka consumer skipped because ClickHouse is unavailable")
+
+    async def start(self) -> None:
+        await self.consumer.start()
+
+    async def publish_pipeline_events(
+        self,
+        request: QueryRequest,
+        routing_decision: RoutingDecision,
+        inference_response: InferenceResponse,
+        received_at: datetime,
+    ) -> None:
+        """Build and publish all events available for one inference request."""
+        if not self.enabled:
+            return
+
+        try:
+            key = str(request.request_id)
+            records: List[Tuple[str, Optional[str], BaseModel]] = []
+
+            records.extend([
+                (self.producer.topics["queries"], key,
+                 build_query_log_entry(request, routing_decision, received_at)),
+                (self.producer.topics["responses"], key,
+                 build_response_log_entry(
+                     request, routing_decision, inference_response,
+                     datetime.now(timezone.utc))),
+            ])
+            records.extend(
+                (self.producer.topics["metrics"], key, metric)
+                for metric in build_metric_entries(
+                    request, routing_decision, inference_response)
+            )
+
+            if inference_response.error:
+                event_error = RuntimeError(inference_response.error)
+                try:
+                    query_id = UUID(request.request_id)
+                except ValueError:
+                    query_id = None
+                records.append((
+                    self.producer.topics["errors"],
+                    key,
+                    build_error_entry(
+                        event_error,
+                        component="inference",
+                        query_id=query_id,
+                        extra={"model_name": inference_response.model_name},
+                    ),
+                ))
+
+            if records:
+                await self.producer.produce_batch(records)
+        except Exception as exc:
+            self.logger.error("Pipeline event publication failed: %s", exc)
+
+    async def flush_all(self) -> None:
+        await self.producer.flush()
+        await self.writer.flush_all()
+
+    async def shutdown(self) -> None:
+        await self.consumer.stop()
+        await self.flush_all()
+        await self.producer.shutdown()
+        await self.writer.shutdown()
+        self.enabled = False

@@ -4,6 +4,7 @@ import json
 import time
 import signal
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from copy import deepcopy
 from typing import Union
@@ -119,12 +120,23 @@ class LLMRouterPlatform:
         setup_logging(**kwargs)
 
     async def _initialize_services(self):
-        """Initialize the modular P2 router and inference services."""
+        """Initialize router, optional P3 pipeline, then inference."""
         self.logger.info("Initializing LLM Router Platform services...")
 
         router = ModelRouter(self.config["router"])
         await router.initialize()
         self.services["router"] = router
+
+        if self.config.get("pipeline", {}).get("enabled", False):
+            try:
+                from src.llm_router_part3_pipeline import PipelineManager
+
+                pipeline = PipelineManager(self.config)
+                await pipeline.initialize()
+                await pipeline.start()
+                self.services["pipeline"] = pipeline
+            except Exception as exc:
+                self.logger.warning("Pipeline initialization skipped: %s", exc)
 
         inference = InferenceEngine(self.config["inference"], router=router)
         await inference.initialize()
@@ -257,6 +269,7 @@ class LLMRouterPlatform:
         @app.post("/route")
         async def route_query(request: Request):
             try:
+                request_received_at = datetime.now(timezone.utc)
                 payload = await request.json()
                 query_request = QueryRequest(
                     query=payload.get("query"),
@@ -266,25 +279,43 @@ class LLMRouterPlatform:
                     max_tokens=payload.get("max_tokens", 512),
                     temperature=payload.get("temperature", 1.0),
                 )
-                response = await self.services["inference"].process_query(query_request)
-                if response.error:
-                    raise RuntimeError(response.error)
+                routing_decision, resp = await self.services["inference"].process_query(
+                    query_request)
+
+                # ===== P3 Pipeline Hook (non-blocking) =====
+                if (
+                    routing_decision is not None
+                    and "pipeline" in self.services
+                    and self.services["pipeline"].enabled
+                ):
+                    asyncio.create_task(
+                        self.services["pipeline"].publish_pipeline_events(
+                            request=query_request,
+                            routing_decision=routing_decision,
+                            inference_response=resp,
+                            received_at=request_received_at,
+                        )
+                    )
+                # ===== End P3 Hook =====
+
+                if resp.error:
+                    raise RuntimeError(resp.error)
 
                 src.utils.metrics.SYSTEM_METRICS.requests_total.labels(
                     endpoint="/route", method="POST", status="200"
                 ).inc()
                 return {
                     "query_id": str(query_request.request_id),
-                    "response": response.response_text,
-                    "model_name": response.model_name,
+                    "response": resp.response_text,
+                    "model_name": resp.model_name,
                     "tokens": {
-                        "input": response.token_count_input,
-                        "output": response.token_count_output,
-                        "total": response.total_tokens,
+                        "input": resp.token_count_input,
+                        "output": resp.token_count_output,
+                        "total": resp.total_tokens,
                     },
-                    "cost_usd": response.cost_usd,
-                    "latency_ms": response.latency_ms,
-                    "cached": response.cached,
+                    "cost_usd": resp.cost_usd,
+                    "latency_ms": resp.latency_ms,
+                    "cached": resp.cached,
                 }
             except Exception as exc:
                 src.utils.metrics.SYSTEM_METRICS.errors_total.labels(

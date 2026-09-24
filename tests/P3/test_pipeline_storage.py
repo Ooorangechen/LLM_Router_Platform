@@ -1,5 +1,7 @@
+import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -52,6 +54,34 @@ class RecordingWriter:
 
     async def _write_to_dlq(self, table, rows, reason):
         self.dlq.append((table, rows, reason))
+
+
+@pytest.mark.asyncio
+async def test_producer_sends_utc_json_and_utc_header(tmp_path):
+    sent = {}
+
+    class FakeProducer:
+        async def send_and_wait(self, topic, value, **kwargs):
+            sent.update(topic=topic, value=value, **kwargs)
+
+    manager = pipeline.KafkaProducerManager(_config(tmp_path))
+    manager.producer = FakeProducer()
+    eastern = timezone(timedelta(hours=-4))
+    event = pipeline.MetricEntry(
+        timestamp=datetime(2026, 9, 22, 8, 30, tzinfo=eastern),
+        metric_name="request_count",
+        value=1,
+        labels={},
+    )
+
+    assert await manager.produce("llm-metrics", "query-1", event) is True
+
+    payload = json.loads(sent["value"])
+    assert payload["timestamp"] == "2026-09-22T12:30:00Z"
+    headers = {name: value.decode() for name, value in sent["headers"]}
+    produced_at = datetime.fromisoformat(headers["produced_at"])
+    assert produced_at.utcoffset() == timedelta(0)
+    assert headers["query_id"] == "query-1"
 
 
 @pytest.mark.asyncio
@@ -137,12 +167,12 @@ async def test_consumer_merges_query_response_and_routes_metrics(tmp_path):
     }
 
     assert await engine._handle_message(
-        "llm-queries", json.dumps(query).encode()) is True
+        "llm-queries", json.dumps(query).encode()) is None
     assert writer.rows == []
     assert await engine._handle_message(
-        "llm-responses", json.dumps(response).encode()) is True
+        "llm-responses", json.dumps(response).encode()) == "query_logs"
     assert await engine._handle_message(
-        "llm-metrics", json.dumps(metric).encode()) is True
+        "llm-metrics", json.dumps(metric).encode()) == "system_metrics"
 
     table, merged = writer.rows[0]
     assert table == "query_logs"
@@ -151,7 +181,10 @@ async def test_consumer_merges_query_response_and_routes_metrics(tmp_path):
     assert merged["status"] == "success"
     assert "model_name" not in merged
     assert "extra_labels" not in merged
-    assert writer.rows[1] == ("system_metrics", metric)
+    assert writer.rows[1] == (
+        "system_metrics",
+        {**metric, "timestamp": "2026-09-22 12:00:01.000"},
+    )
 
 
 @pytest.mark.asyncio
@@ -159,9 +192,55 @@ async def test_consumer_invalid_json_goes_to_local_dlq(tmp_path):
     writer = RecordingWriter()
     engine = pipeline.KafkaConsumerEngine(_config(tmp_path), writer)
 
-    assert await engine._handle_message("llm-metrics", b"not-json") is False
-    assert writer.dlq[0][0] == "kafka"
-    assert writer.dlq[0][1][0]["topic"] == "llm-metrics"
+    assert await engine._handle_message("llm-metrics", b"not-json") is None
+    dlq_file = next((tmp_path / "dlq").glob("kafka_*.jsonl"))
+    entry = pipeline.DeadLetterEntry.model_validate_json(dlq_file.read_text())
+    assert entry.original_topic == "llm-metrics"
+    assert entry.original_message == "not-json"
+    assert entry.first_failed_at.tzinfo == timezone.utc
+    assert entry.last_failed_at.tzinfo == timezone.utc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flush_result, should_commit", [((1, 0), True), ((0, 1), False)])
+async def test_consumer_commits_only_after_durable_write(
+    tmp_path, flush_result, should_commit
+):
+    class Writer(RecordingWriter):
+        async def flush_table(self, table):
+            return flush_result
+
+    class Consumer:
+        def __init__(self):
+            self.polls = 0
+            self.committed = False
+
+        async def getmany(self, **kwargs):
+            self.polls += 1
+            if self.polls > 1:
+                raise asyncio.CancelledError
+            metric = {
+                "timestamp": "2026-09-22T12:00:01Z",
+                "service": "llm-router",
+                "metric_name": "request_count",
+                "value": 1.0,
+                "labels": {},
+            }
+            record = SimpleNamespace(
+                topic="llm-metrics", value=json.dumps(metric).encode())
+            return {"partition": [record]}
+
+        async def commit(self):
+            self.committed = True
+
+    engine = pipeline.KafkaConsumerEngine(_config(tmp_path), Writer())
+    engine.consumer = Consumer()
+    engine.running = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await engine._consume_loop()
+
+    assert engine.consumer.committed is should_commit
 
 
 @pytest.mark.asyncio
@@ -173,23 +252,44 @@ async def test_writer_buffers_flushes_and_retries(tmp_path):
             self.calls = 0
             self.inserted = None
 
-        def insert(self, table, data, column_names):
+        def raw_insert(self, table, *, insert_block, fmt):
             self.calls += 1
             if self.calls < 3:
                 raise ConnectionError("temporary")
-            self.inserted = (table, data, column_names)
+            self.inserted = (table, insert_block, fmt)
 
     writer.client = FakeClient()
     await writer.buffer_write("system_metrics", {"metric_name": "a", "value": 1})
     await writer.buffer_write("system_metrics", {"metric_name": "b", "value": 2})
 
     assert writer.client.calls == 3
-    assert writer.client.inserted == (
-        "system_metrics",
-        [["a", 1], ["b", 2]],
-        ["metric_name", "value"],
-    )
+    table, block, fmt = writer.client.inserted
+    assert table == "system_metrics"
+    assert [json.loads(line) for line in block.splitlines()] == [
+        {"metric_name": "a", "value": 1},
+        {"metric_name": "b", "value": 2},
+    ]
+    assert fmt == "JSONEachRow"
     assert writer._buffers["system_metrics"] == []
+
+
+def test_clickhouse_datetime_is_utc_and_millisecond_precision():
+    eastern = timezone(timedelta(hours=-4))
+    assert pipeline._ch_datetime(
+        datetime(2026, 9, 22, 8, 30, 1, 123456, tzinfo=eastern)
+    ) == "2026-09-22 12:30:01.123"
+    assert pipeline._ch_datetime(
+        "2026-09-22T12:30:01.123456Z"
+    ) == "2026-09-22 12:30:01.123"
+
+
+def test_clickhouse_schema_declares_every_timestamp_column_as_utc():
+    schema = Path("clickhouse/schema.sql").read_text(encoding="utf-8")
+    for column in (
+        "request_received_at", "response_completed_at", "timestamp", "updated_at"
+    ):
+        assert f"{column}" in schema
+    assert schema.count("DateTime64(3, 'UTC')") == 4
 
 
 @pytest.mark.asyncio
@@ -204,6 +304,7 @@ async def test_writer_failed_batch_is_persisted_and_replayed(tmp_path):
     record = json.loads(dlq_file.read_text().strip())
     assert record["table"] == "system_metrics"
     assert record["reason"] == "down"
+    assert datetime.fromisoformat(record["timestamp"]).utcoffset() == timedelta(0)
 
     writer._execute_insert = AsyncMock(return_value=None)
     assert await writer.replay_dlq() == (1, 0)

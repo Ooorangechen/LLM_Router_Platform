@@ -1,7 +1,8 @@
 -- Read this SQL file in ClickHouseWriter.initialize(), split by semicolon,
 -- then execute each non-empty statement.
--- The hourly_metrics materialized view writes query_logs aggregates into
--- model_performance and is enabled by default.
+-- The hourly_metrics materialized view writes query_logs aggregate states into
+-- model_performance_agg and is enabled by default; model_performance is the
+-- view that merges those states.
 
 -- ============================================================
 -- 1. query_logs: Query + Response merged detail table
@@ -72,32 +73,57 @@ TTL timestamp + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
 -- ============================================================
--- 3. model_performance: Model dimension aggregation table
---    ReplacingMergeTree, partitioned by month, TTL 60 days
---    Written by consumer engine or Flink job
+-- 3. model_performance_agg: Model dimension aggregate states
+--    AggregatingMergeTree, partitioned by month, TTL 60 days
+--    Written by hourly_metrics. Each insert block adds partial states that
+--    merge correctly, so avg/p95/p99 stay exact across blocks.
 -- ============================================================
-CREATE TABLE IF NOT EXISTS model_performance
+CREATE TABLE IF NOT EXISTS model_performance_agg
 (
     day                 Date,
     model_name          LowCardinality(String),
-    provider            LowCardinality(String),
-    request_count       UInt64,
-    success_count       UInt64,
-    error_count         UInt64,
-    total_tokens_input  UInt64,
-    total_tokens_output UInt64,
-    total_cost_usd      Decimal(32, 8),
-    avg_latency_ms      Float64,
-    p95_latency_ms      Float64,
-    p99_latency_ms      Float64,
-    cache_hit_count     UInt64,
-    updated_at          DateTime64(3, 'UTC') DEFAULT now64()
+    provider            SimpleAggregateFunction(any, String),
+    request_count       SimpleAggregateFunction(sum, UInt64),
+    success_count       SimpleAggregateFunction(sum, UInt64),
+    error_count         SimpleAggregateFunction(sum, UInt64),
+    total_tokens_input  SimpleAggregateFunction(sum, UInt64),
+    total_tokens_output SimpleAggregateFunction(sum, UInt64),
+    total_cost_usd      SimpleAggregateFunction(sum, Decimal(38, 8)),
+    avg_latency_ms      AggregateFunction(avg, UInt32),
+    p95_latency_ms      AggregateFunction(quantileExact(0.95), UInt32),
+    p99_latency_ms      AggregateFunction(quantileExact(0.99), UInt32),
+    cache_hit_count     SimpleAggregateFunction(sum, UInt64),
+    updated_at          SimpleAggregateFunction(max, DateTime64(3, 'UTC'))
 )
-ENGINE = ReplacingMergeTree(updated_at)
+ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(day)
 ORDER BY (day, model_name)
 TTL day + INTERVAL 60 DAY
 SETTINGS index_granularity = 8192;
+
+-- ============================================================
+-- 3b. model_performance: Model dimension aggregation (view)
+--     Same columns as the P3 table; merges model_performance_agg states
+-- ============================================================
+CREATE VIEW IF NOT EXISTS model_performance
+AS
+SELECT
+    day,
+    model_name,
+    any(provider)                                                             AS provider,
+    sum(request_count)                                                        AS request_count,
+    sum(success_count)                                                        AS success_count,
+    sum(error_count)                                                          AS error_count,
+    sum(total_tokens_input)                                                   AS total_tokens_input,
+    sum(total_tokens_output)                                                  AS total_tokens_output,
+    sum(total_cost_usd)                                                       AS total_cost_usd,
+    avgMerge(avg_latency_ms)                                                  AS avg_latency_ms,
+    quantileExactMerge(0.95)(p95_latency_ms)                                  AS p95_latency_ms,
+    quantileExactMerge(0.99)(p99_latency_ms)                                  AS p99_latency_ms,
+    sum(cache_hit_count)                                                      AS cache_hit_count,
+    max(updated_at)                                                           AS updated_at
+FROM model_performance_agg
+GROUP BY day, model_name;
 
 -- ============================================================
 -- 4. user_analytics: User dimension aggregation table
@@ -126,7 +152,7 @@ SETTINGS index_granularity = 8192;
 --    Automatically triggered when writing from query_logs
 -- ============================================================
 CREATE MATERIALIZED VIEW IF NOT EXISTS hourly_metrics
-TO model_performance
+TO model_performance_agg
 AS
 SELECT
     toDate(request_received_at)                                               AS day,
@@ -138,13 +164,12 @@ SELECT
     sum(token_count_input)                                                    AS total_tokens_input,
     sum(token_count_output)                                                   AS total_tokens_output,
     sum(cost_usd)                                                             AS total_cost_usd,
-    avg(latency_ms)                                                           AS avg_latency_ms,
-    quantileExact(0.95)(latency_ms)                                           AS p95_latency_ms,
-    quantileExact(0.99)(latency_ms)                                           AS p99_latency_ms,
+    avgState(latency_ms)                                                      AS avg_latency_ms,
+    quantileExactState(0.95)(latency_ms)                                      AS p95_latency_ms,
+    quantileExactState(0.99)(latency_ms)                                      AS p99_latency_ms,
     sum(cached)                                                               AS cache_hit_count,
-    now64()                                                                   AS updated_at
+    now64(3, 'UTC')                                                           AS updated_at
 FROM query_logs
-WHERE request_received_at >= now() - INTERVAL 2 HOUR
 GROUP BY
     toStartOfHour(request_received_at),
     toDate(request_received_at),

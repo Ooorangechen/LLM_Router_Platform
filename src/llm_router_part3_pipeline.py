@@ -1,14 +1,25 @@
+import json
+import time
 import traceback
 from pathlib import Path
 from uuid import UUID, uuid4
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any, Tuple, Literal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from src.utils.schema import RoutingDecision, InferenceResponse, QueryRequest
 from src.utils.metrics import PIPELINE_METRICS
-import asyncio 
+import asyncio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from src.utils.constants import KafkaTopics
 from src.utils.logger import get_logger
+
+# Decision: import clickhouse_connect optionally. P3 lists it as a hard
+# dependency (D2), but a missing driver must degrade the writer the same way a
+# refused connection does instead of breaking `import` for pipeline.enabled=False.
+try:
+    import clickhouse_connect
+except ImportError:
+    clickhouse_connect = None
 
 # TASK 3.2
 
@@ -228,164 +239,134 @@ def build_error_entry(
 # TASK 3.3: Kafka Producer Manager
 
 class KafkaProducerManager:
+    """Publish pipeline events to Kafka, degrading to a no-op when unreachable."""
 
-    def __init__(self, config:Dict[str, Any]):
-        # unified logging system requirement
+    def __init__(self, config: Dict[str, Any]):
         self.logger = get_logger("kafka")
-
-        # when `pipeline.enabled=False`, 
-        # the main P2 chain behavior is completely consistent with P2 acceptance criteria
-        self._pipeline_enabled = config.get("pipeline", {}).get('enabled', False) 
-        self.enabled = self._pipeline_enabled
+        # pipeline.enabled=False keeps the P2 chain byte-for-byte unchanged.
+        self.enabled = config.get("pipeline", {}).get("enabled", False)
 
         kafka_config = config.get("kafka", {})
-        self.bootstrap_servers = kafka_config.get("bootstrap_servers","localhost:9092")
-        # read from config.yaml directly, ignoring topics_file for now. 
-        self.topics : Dict[str, Any] = dict(kafka_config.get("topics", {}))
-
         producer_config = kafka_config.get("producer", {})
+        self.bootstrap_servers = kafka_config.get(
+            "bootstrap_servers", "localhost:9092")
+        # aiokafka has no `retries` option, so P3's kafka.producer.retries is
+        # spent on connection attempts in initialize() instead.
         self.max_attempts = int(producer_config.get("retries", 3))
         self.producer_options = {
             "bootstrap_servers": self.bootstrap_servers,
             "acks": producer_config.get("acks", "all"),
-            "max_batch_size": producer_config.get("batch_size",16384),
-            "linger_ms": producer_config.get("linger_ms",5),
-            "compression_type": producer_config.get("compression_type","gzip"),
-            "request_timeout_ms": producer_config.get("request_timeout_ms",30000),
-            "enable_idempotence": producer_config.get("enable_idempotence",True),
+            "max_batch_size": producer_config.get("batch_size", 16384),
+            "linger_ms": producer_config.get("linger_ms", 5),
+            "compression_type": producer_config.get("compression_type", "gzip"),
+            "request_timeout_ms": producer_config.get("request_timeout_ms", 30000),
+            "enable_idempotence": producer_config.get("enable_idempotence", True),
         }
         self.producer: Optional[AIOKafkaProducer] = None
 
-    async def initialize(self):
-        # producer configuration read from config.yaml ovveriadable with default setting based on p3
-        """
-        `initialize()` internally `try` to connect Kafka (`@retry` 3 times), 
-        all fail → `self.enabled=False` + `logger.warning("Kafka producer disabled: connection failed")`, 
-        **does not throw exceptions upward**, service starts normally;
-        """
+    async def initialize(self) -> None:
+        """Connect to Kafka; on failure degrade to disabled without raising."""
         if not self.enabled:
-            return 
+            return
+
         last_error: Optional[Exception] = None
-
         for _ in range(self.max_attempts):
-            producer: Optional[AIOKafkaProducer] = None
+            producer = AIOKafkaProducer(**self.producer_options)
             try:
-                producer = AIOKafkaProducer(**self.producer_options)
                 await producer.start()
-
                 self.producer = producer
-                self.logger.info("Kafka producer connected to %s", self.bootstrap_servers)
-                return 
+                self.logger.info(
+                    "Kafka producer connected to %s", self.bootstrap_servers)
+                return
             except Exception as e:
                 last_error = e
-                if producer is not None:
-                    try:
-                        await producer.stop()
-                    except Exception:
-                        pass
+                try:
+                    await producer.stop()   # release a half-open connection
+                except Exception:
+                    pass
 
         self.enabled = False
-        self.producer = None
-        self.logger.warning("Kafka producer disabled: connection failed: %s", last_error,)
-    
+        self.logger.warning(
+            "Kafka producer disabled: connection failed: %s", last_error)
+
     # skipping optional async def _ensure_topics_exist(self):
 
     async def produce(
-            self, topic:str, key:Optional[str], 
-            value:BaseModel, headers:Optional[Dict[str,str]] = None) -> bool:
-        """
-        If `pipeline.enabled=False`, main.py does not instantiate KafkaProducerManager at all;
-        if `pipeline.enabled=True` but Kafka cannot connect, 
-        instantiate but with enabled=False, 
-        produce() directly returns True (no-op success), does not block the main chain.
-        """
+            self, topic: str, key: Optional[str], value: BaseModel,
+            headers: Optional[Dict[str, str]] = None) -> bool:
+        """Send one event. Never raises, so the main chain cannot be blocked."""
+        # Disabled means Kafka is unreachable, which is not the caller's failure:
+        # produce() reports no-op success instead of propagating a degradation.
         if not self.enabled or self.producer is None:
             return True
 
         try:
-            message_headers = dict(headers or {})
-            message_headers.update({
-                "query_id": key or "",
-                "produced_at": datetime.now(timezone.utc).isoformat(),
-                "schema_version": "1.0"
-            })
-
-            kafka_headers = [
-                (name, header_value.encode('utf-8')) 
-                for name, header_value in message_headers.items()
-            ]
-        
-            kafka_key = (key.encode('utf-8') if key is not None else None)
-
+            headers = {**(headers or {}), "query_id": key or "",
+                       "produced_at": datetime.now(timezone.utc).isoformat(),
+                       "schema_version": "1.0"}
             await self.producer.send_and_wait(
-                topic=topic,
-                key=kafka_key,
-                value=value.model_dump_json().encode("utf-8"),
-                headers=kafka_headers
-            )
-
+                topic,
+                value.model_dump_json().encode("utf-8"),
+                # Keying by query_id keeps one query's events on one partition.
+                key=key.encode("utf-8") if key else None,
+                headers=[(name, text.encode("utf-8"))
+                         for name, text in headers.items()])
             PIPELINE_METRICS.kafka_produce_total.labels(
-                topic = topic, 
-                status="success"
-            ).inc()
-
+                topic=topic, status="success").inc()
             return True
-
         except Exception as e:
             PIPELINE_METRICS.kafka_produce_total.labels(
-                topic=topic,
-                status="failure"
-            ).inc()
-
+                topic=topic, status="failure").inc()
             self.logger.error(
-                "Kafka produce failed: topic=%s, error=%s",
-                topic,
-                e,
-            )
-
+                "Kafka produce failed: topic=%s, error=%s", topic, e)
             return False
-    
+
     async def produce_batch(
-            self, records: List[Tuple[str, Optional[str], BaseModel]]) -> Tuple[int, int]:
+            self, records: List[Tuple[str, Optional[str], BaseModel]]
+    ) -> Tuple[int, int]:
+        """Send several events concurrently and return (success, failure)."""
         results = await asyncio.gather(
-            *[
-                self.produce(topic, key, value)
-                for topic, key, value in records
-            ]
-        )
+            *(self.produce(topic, key, value) for topic, key, value in records))
+        success = sum(results)
+        return success, len(results) - success
 
-        success_count = sum(results)
-        failure_count = len(results) - success_count
-        return success_count, failure_count
-
-    async def flush(self) -> None:  
+    async def flush(self) -> None:
         if self.producer is None:
             return
 
         try:
             await self.producer.flush()
         except Exception as e:
-            self.logger.error(
-                "Kafka producer flush failed: %s", e
-            )
+            self.logger.error("Kafka producer flush failed: %s", e)
 
     async def shutdown(self) -> None:
         if self.producer is None:
-            return 
+            return
 
         try:
-            await self.producer.flush()
+            await self.flush()
             await self.producer.stop()
             self.logger.info("Kafka producer stopped")
         except Exception as e:
-            self.logger.error("" \
-            "kafka producer shutdown failed: %s", e)
+            self.logger.error("Kafka producer shutdown failed: %s", e)
         finally:
-            self.producer = None 
+            self.producer = None
             self.enabled = False
 
 
 # TASK 3.4: Kafka Consumer Engine + ClickHouse Writer
+
+def _ch_datetime(value: Any) -> str:
+    """Render a datetime (or ISO string) as a ClickHouse DateTime64(3,'UTC')."""
+    # Decision: format as "YYYY-MM-DD HH:MM:SS.mmm" instead of passing
+    # .isoformat() through. JSONEachRow parses that shape on every ClickHouse
+    # version, while an ISO string carrying a "+00:00" offset does not.
+    if isinstance(value, datetime):
+        dt = _as_utc(value)
+    else:
+        dt = _as_utc(datetime.fromisoformat(str(value)))
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
 
 class KafkaConsumerEngine:
     """Consume pipeline events and dispatch them to ClickHouseWriter."""
@@ -399,7 +380,6 @@ class KafkaConsumerEngine:
 
         kafka_config = config.get("kafka", {})
         consumer_config = kafka_config.get("consumer", {})
-        topics = kafka_config.get("topics", {})
 
         self.bootstrap_servers = kafka_config.get(
             "bootstrap_servers", "localhost:9092")
@@ -413,16 +393,14 @@ class KafkaConsumerEngine:
         self.fetch_min_bytes = consumer_config.get("fetch_min_bytes", 1024)
         self.fetch_max_wait_ms = consumer_config.get("fetch_max_wait_ms", 500)
 
-        # Subscribe only to business topics. The DLQ topic must not be consumed
-        # by this engine, otherwise a failed DLQ message can create a loop.
-        self.topics = [
-            topics.get("queries", "llm-queries"),
-            topics.get("responses", "llm-responses"),
-            topics.get("metrics", "llm-metrics"),
-            topics.get("errors", "llm-errors"),
-        ]
-        self.dead_letter_topic = topics.get(
-            "dead_letter", "llm-dead-letter")
+        # Business topics only: consuming the DLQ topic loops failures back here.
+        self.topics = [KafkaTopics.QUERIES.value, KafkaTopics.RESPONSES.value,
+                       KafkaTopics.METRICS.value, KafkaTopics.ERRORS.value]
+        # A query and its response arrive as separate events; hold the first
+        # half until its partner lands so query_logs gets one complete row.
+        self._pending: Dict[str, Dict[str, Any]] = {}
+        self._dlq_local_path = Path(
+            config.get("pipeline", {}).get("dlq_local_dir", "data/dlq"))
 
         self.consumer: Optional[AIOKafkaConsumer] = None
         self.running = False
@@ -430,69 +408,157 @@ class KafkaConsumerEngine:
 
     async def initialize(self) -> None:
         """Create and start the Kafka consumer with graceful degradation."""
-        # TODO:
-        # 1. Return immediately when self.enabled is False.
-        # 2. Construct AIOKafkaConsumer with self.topics and the configured
-        #    bootstrap/group/poll/fetch options.
-        # 3. Force enable_auto_commit=False; manual commit is a P3 invariant.
-        # 4. Await consumer.start() and assign the connected consumer.
-        # 5. On connection failure, set consumer=None and enabled=False, log a
-        #    warning, and do not propagate the exception to application startup.
         if not self.enabled:
             return
-        raise NotImplementedError
+
+        try:
+            self.consumer = AIOKafkaConsumer(
+                *self.topics,
+                bootstrap_servers=self.bootstrap_servers,
+                group_id=self.group_id,
+                # Manual commit is a P3 invariant, so the config value is ignored.
+                enable_auto_commit=False,
+                auto_offset_reset=self.auto_offset_reset,
+                max_poll_records=self.max_poll_records,
+                max_poll_interval_ms=self.max_poll_interval_ms,
+                fetch_min_bytes=self.fetch_min_bytes,
+                fetch_max_wait_ms=self.fetch_max_wait_ms,
+            )
+            await self.consumer.start()
+            self.logger.info(
+                "Kafka consumer started (group_id=%s)", self.group_id)
+        except Exception as e:
+            self.consumer = None
+            self.enabled = False
+            self.logger.warning(
+                "Kafka consumer disabled: connection failed: %s", e)
 
     async def start(self) -> None:
         """Start the consume loop as one background asyncio task."""
-        # TODO:
-        # 1. Return when disabled or when initialize() produced no consumer.
-        # 2. Return when a consume task is already running.
-        # 3. Set running=True.
-        # 4. Store asyncio.create_task(self._consume_loop()) so stop() can wait
-        #    for or cancel the same task during application shutdown.
-        raise NotImplementedError
+        if not self.enabled or self.consumer is None or self.running:
+            return
+
+        self.running = True
+        self._consume_task = asyncio.create_task(self._consume_loop())
 
     async def _consume_loop(self) -> None:
         """Poll, dispatch, flush, and manually commit Kafka messages."""
-        # TODO:
-        # 1. Poll at most self.max_poll_records messages per batch. getmany()
-        #    is the recommended implementation because commit is batch-based.
-        # 2. Call _handle_message() for every record and collect the ClickHouse
-        #    tables affected by the batch.
-        # 3. Flush each affected table after dispatching the batch.
-        # 4. Commit Kafka offsets only when every required ClickHouse flush
-        #    succeeds. Never commit before durable persistence.
-        # 5. On parsing/dispatch/write failure, leave the offset uncommitted,
-        #    persist the original message to the DLQ, record pipeline metrics,
-        #    and continue consuming rather than terminating this loop.
-        # 6. Exit cleanly when self.running becomes False.
-        raise NotImplementedError
+        while self.running:
+            try:
+                batches = await self.consumer.getmany(
+                    timeout_ms=self.fetch_max_wait_ms,
+                    max_records=self.max_poll_records)
+
+                affected = set()
+                for records in batches.values():
+                    for record in records:
+                        table = await self._handle_message(
+                            record.topic, record.value)
+                        if table is not None:
+                            affected.add(table)
+                            PIPELINE_METRICS.messages_consumed.labels(
+                                topic=record.topic, group_id=self.group_id).inc()
+
+                failed_total = 0
+                for table in affected:
+                    _, failed = await self.clickhouse_writer.flush_table(table)
+                    failed_total += failed
+
+                # Offsets advance only once the batch is durable. A failed batch
+                # stays uncommitted and is redelivered; ReplacingMergeTree folds
+                # away the duplicate rows that redelivery produces.
+                if affected and not failed_total:
+                    await self.consumer.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Poll, dispatch, flush and commit all degrade the same way:
+                # log it, keep the offset, keep consuming.
+                PIPELINE_METRICS.consumer_errors.inc()
+                self.logger.error("Consume batch failed: %s", e)
+                await asyncio.sleep(1)
 
     async def _handle_message(
-            self, topic: str, msg_value: bytes) -> bool:
-        """Decode one Kafka message and route it to the correct table buffer."""
-        # TODO:
-        # 1. Decode msg_value as UTF-8 and parse its JSON object.
-        # 2. Route llm-metrics to the system_metrics buffer.
-        # 3. Convert llm-errors to a system_metrics row whose metric_name is
-        #    "error_event", unless a dedicated error table is added later.
-        # 4. Route llm-queries and llm-responses toward query_logs. These two
-        #    events contain partial rows, so pair them by query_id before asking
-        #    ClickHouseWriter to buffer one complete query_logs row.
-        # 5. Return True only when the message was accepted by the writer.
-        # 6. On unknown topic or invalid JSON, write the original payload to the
-        #    local/Kafka DLQ path and return False without raising upward.
-        raise NotImplementedError
+            self, topic: str, msg_value: bytes) -> Optional[str]:
+        """Buffer one message and return the ClickHouse table it touched."""
+        try:
+            payload = json.loads(msg_value.decode("utf-8"))
+
+            if topic == KafkaTopics.METRICS.value:
+                table = "system_metrics"
+                row = {**payload,
+                       "timestamp": _ch_datetime(payload["timestamp"])}
+
+            elif topic == KafkaTopics.ERRORS.value:
+                # schema.sql has no error table, so an error becomes a metric row.
+                table = "system_metrics"
+                row = {"timestamp": _ch_datetime(payload["timestamp"]),
+                       "service": "llm-router", "metric_name": "error_event",
+                       "value": 1.0,
+                       "labels": {"query_id": str(payload.get("query_id") or ""),
+                                  "error_type": payload["error_type"],
+                                  "component": payload["component"],
+                                  "severity": payload["severity"]}}
+
+            elif topic in (KafkaTopics.QUERIES.value, KafkaTopics.RESPONSES.value):
+                table = "query_logs"
+                other = self._pending.pop(payload["query_id"], None)
+                if other is None:
+                    self._pending[payload["query_id"]] = payload
+                    return None                      # half a row; wait
+                query, response = ((payload, other)
+                                   if topic == KafkaTopics.QUERIES.value
+                                   else (other, payload))
+                # Entry field names are the query_logs column names, so the two
+                # halves merge directly; response wins on status and on
+                # token_count_input because it carries the actual token count.
+                row = {**query, **response}
+                row.pop("extra_labels", None)        # not a column
+                row.pop("model_name", None)          # the column is selected_model
+                for key in ("has_context", "has_attachments",
+                            "cached", "compressed_context"):
+                    row[key] = int(row[key])         # the columns are UInt8
+                for key in ("request_received_at", "response_completed_at"):
+                    row[key] = _ch_datetime(row[key])
+            else:
+                raise ValueError(f"unknown topic: {topic}")
+
+            await self.clickhouse_writer.buffer_write(table, row)
+            return table
+        except Exception as e:
+            # P3 §3.4: a message we cannot dispatch is persisted as-is and
+            # skipped, so one bad payload cannot stall its partition forever.
+            # These files keep their own kafka_ prefix because replay_dlq()
+            # only replays batches that name a ClickHouse table.
+            now = datetime.now(timezone.utc)
+            path = self._dlq_local_path / f"kafka_{now.strftime('%Y%m%d_%H')}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(DeadLetterEntry(
+                    original_topic=topic,
+                    original_message=msg_value.decode("utf-8", errors="replace"),
+                    failure_reason=str(e), failure_count=1,
+                    first_failed_at=now,
+                    last_failed_at=now).model_dump_json() + "\n")
+            PIPELINE_METRICS.dead_letter_total.labels(source="kafka").inc()
+            self.logger.error("Message sent to DLQ: topic=%s, error=%s", topic, e)
+            return None
 
     async def stop(self) -> None:
         """Stop the background loop and close the Kafka consumer."""
-        # TODO:
-        # 1. Set running=False so _consume_loop can finish.
-        # 2. Await or cancel self._consume_task and clear the task reference.
-        # 3. Await consumer.stop() to leave the group and close connections.
-        # 4. Clear self.consumer. Log shutdown errors instead of propagating
-        #    them into the application shutdown sequence.
-        raise NotImplementedError
+        self.running = False
+        try:
+            if self._consume_task is not None:
+                self._consume_task.cancel()
+                await asyncio.gather(self._consume_task, return_exceptions=True)
+            if self.consumer is not None:
+                await self.consumer.stop()
+                self.logger.info("Kafka consumer stopped")
+        except Exception as e:
+            self.logger.error("Kafka consumer shutdown failed: %s", e)
+        finally:
+            self._consume_task = None
+            self.consumer = None
 
 
 class ClickHouseWriter:
@@ -520,109 +586,249 @@ class ClickHouseWriter:
         self.send_receive_timeout_sec = clickhouse_config.get(
             "send_receive_timeout_sec", 300)
 
+        # Allowed tables come from config; the defaults are the four tables in
+        # clickhouse/schema.sql. The table name is interpolated into SQL, so it
+        # must never come from message content.
+        self.tables = set(clickhouse_config.get("tables", {}).values()) or {
+            "query_logs", "system_metrics",
+            "model_performance", "user_analytics",
+        }
+
         self.client: Optional[Any] = None
         self._buffers: Dict[str, List[Dict[str, Any]]] = {}
+        self._lock = asyncio.Lock()
         self._dlq_local_path = Path(pipeline_config.get(
             "dlq_local_dir", "data/dlq"))
 
     async def initialize(self) -> None:
         """Connect to ClickHouse, prepare the DLQ directory, and apply DDL."""
-        # TODO:
-        # 1. Return immediately when self.enabled is False.
-        # 2. Create self._dlq_local_path and its archived/ child directory.
-        # 3. Build a clickhouse_connect HTTP client from the configured host,
-        #    port, credentials, database, and timeout values.
-        # 4. Run blocking clickhouse_connect calls through asyncio.to_thread().
-        # 5. Verify the connection, then call _create_tables_if_not_exists().
-        # 6. On failure, set client=None and enabled=False, log a warning, and
-        #    do not propagate the exception to application startup.
-        raise NotImplementedError
+        if not self.enabled:
+            return
+
+        try:
+            if clickhouse_connect is None:
+                raise ImportError("clickhouse_connect is not installed")
+
+            self._dlq_local_path.mkdir(parents=True, exist_ok=True)
+            (self._dlq_local_path / "archived").mkdir(
+                parents=True, exist_ok=True)
+
+            # HTTP client (port 8123); every clickhouse_connect call is
+            # blocking, so it runs through asyncio.to_thread().
+            self.client = await asyncio.to_thread(
+                clickhouse_connect.get_client,
+                host=self.host,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                database=self.database,
+                connect_timeout=self.connection_timeout_sec,
+                send_receive_timeout=self.send_receive_timeout_sec,
+            )
+            await asyncio.to_thread(self.client.command, "SELECT 1")
+            self.logger.info(
+                "ClickHouse connected: %s:%s", self.host, self.port)
+
+            await self._create_tables_if_not_exists()
+        except Exception as e:
+            self.client = None
+            self.enabled = False
+            self.logger.warning(
+                "ClickHouse writer disabled: connection failed: %s", e)
 
     async def _create_tables_if_not_exists(self) -> None:
         """Execute every idempotent statement in clickhouse/schema.sql."""
-        # TODO:
-        # 1. Resolve and read self.schema_file as UTF-8 text.
-        # 2. Split the file on semicolons and discard empty/comment-only parts.
-        # 3. Execute each DDL statement sequentially through asyncio.to_thread.
-        # 4. Log the failing statement and warning if DDL execution fails; table
-        #    creation failure must degrade ClickHouse rather than crash startup.
-        raise NotImplementedError
+        try:
+            sql_text = self.schema_file.read_text(encoding="utf-8")
+        except Exception as e:
+            self.logger.warning("ClickHouse schema file unreadable: %s", e)
+            return
+
+        statements = []
+        for part in sql_text.split(";"):
+            body = "\n".join(
+                line for line in part.splitlines()
+                if line.strip() and not line.strip().startswith("--")
+            ).strip()
+            if body:
+                statements.append(body)
+
+        for statement in statements:
+            try:
+                await asyncio.to_thread(self.client.command, statement)
+            except Exception as e:
+                # DDL failure degrades ClickHouse; it must not crash startup.
+                self.logger.warning(
+                    "ClickHouse DDL failed: %s | statement=%s", e, statement)
 
     async def buffer_write(
             self, table: str, row: Dict[str, Any]) -> None:
         """Append one row and flush its table when batch_size is reached."""
-        # TODO:
-        # 1. Return as a no-op when the writer is disabled.
-        # 2. Validate table against the configured/allowed ClickHouse tables.
-        # 3. Append a copy of row to self._buffers[table].
-        # 4. Call flush_table(table) when the buffer reaches self.batch_size.
-        # 5. Protect buffer mutation with an asyncio lock in the implementation
-        #    because consumer and periodic flush tasks may run concurrently.
-        raise NotImplementedError
+        if not self.enabled:
+            return
+        if table not in self.tables:
+            self.logger.error("Unknown ClickHouse table: %s", table)
+            return
+
+        async with self._lock:
+            buffer = self._buffers.setdefault(table, [])
+            buffer.append(dict(row))
+            should_flush = len(buffer) >= self.batch_size
+
+        if should_flush:
+            await self.flush_table(table)
 
     async def flush_table(self, table: str) -> Tuple[int, int]:
         """Write one table buffer and return (written, failed)."""
-        # TODO:
-        # 1. Return (0, 0) when the table buffer is empty.
-        # 2. Atomically detach the current batch so new rows can keep buffering.
-        # 3. Call _execute_insert(table, rows).
-        # 4. On success, increment ClickHouse success/latency metrics and return
-        #    (len(rows), 0).
-        # 5. After final failure, call _write_to_dlq(), increment failure/DLQ
-        #    metrics, and return (0, len(rows)); never raise to the consumer.
-        raise NotImplementedError
+        async with self._lock:
+            rows = self._buffers.get(table) or []
+            if not rows:
+                return (0, 0)
+            # Detach the batch under the lock so new rows keep buffering.
+            self._buffers[table] = []
+
+        try:
+            await self._execute_insert(table, rows)
+            PIPELINE_METRICS.clickhouse_write_total.labels(
+                table=table, status="success").inc()
+            return (len(rows), 0)
+        except Exception as e:
+            PIPELINE_METRICS.clickhouse_write_total.labels(
+                table=table, status="failure").inc()
+            self.logger.error(
+                "ClickHouse insert failed, batch sent to DLQ: table=%s, "
+                "rows=%d, error=%s", table, len(rows), e)
+            await self._write_to_dlq(table, rows, str(e))
+            return (0, len(rows))
 
     async def flush_all(self) -> None:
         """Flush every non-empty table buffer independently."""
-        # TODO:
-        # 1. Snapshot the current table names.
-        # 2. Call flush_table() for every table with buffered rows.
-        # 3. Continue with other tables when one table fails and enters DLQ.
-        raise NotImplementedError
+        for table in list(self._buffers.keys()):
+            # flush_table never raises, so one table entering DLQ does not
+            # stop the remaining tables from being written.
+            await self.flush_table(table)
 
     async def _execute_insert(
             self, table: str, rows: List[Dict[str, Any]]) -> None:
         """Insert rows with exponential-backoff retry."""
-        # TODO:
-        # 1. Build the batch INSERT for the trusted table name using the
-        #    JSONEachRow-compatible dictionaries.
-        # 2. Execute the blocking client call with asyncio.to_thread().
-        # 3. Record pipeline_clickhouse_write_latency_seconds per attempt.
-        # 4. On failure, retry up to self.retry_max with exponential delays
-        #    derived from self.retry_backoff_base_ms (1s, 2s, 4s by default).
-        # 5. Raise the final exception to flush_table(), which owns DLQ fallback.
-        raise NotImplementedError
+        if self.client is None:
+            raise RuntimeError("ClickHouse client is not connected")
+
+        # Decision: raw_insert with fmt="JSONEachRow" instead of client.insert().
+        # P3 §3.4 specifies INSERT ... FORMAT JSONEachRow with list[dict] rows,
+        # and raw_insert takes the serialized rows without a column list.
+        block = "\n".join(json.dumps(row, default=str) for row in rows)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(self.retry_max):
+            started = time.perf_counter()
+            try:
+                await asyncio.to_thread(
+                    self.client.raw_insert,
+                    table,
+                    insert_block=block,
+                    fmt="JSONEachRow",
+                )
+                PIPELINE_METRICS.clickhouse_write_latency_seconds.labels(
+                    table=table).observe(time.perf_counter() - started)
+                return
+            except Exception as e:
+                PIPELINE_METRICS.clickhouse_write_latency_seconds.labels(
+                    table=table).observe(time.perf_counter() - started)
+                last_error = e
+                if attempt < self.retry_max - 1:
+                    PIPELINE_METRICS.clickhouse_write_total.labels(
+                        table=table, status="retry").inc()
+                    # 1s, 2s, 4s by default.
+                    await asyncio.sleep(
+                        self.retry_backoff_base_ms / 1000 * (2 ** attempt))
+
+        # flush_table() owns the DLQ fallback.
+        raise last_error
 
     async def _write_to_dlq(
             self, table: str, rows: List[Dict[str, Any]],
             reason: str) -> None:
         """Append one failed ClickHouse batch to an hourly JSONL file."""
-        # TODO:
-        # 1. Select data/dlq/YYYYMMDD_HH.jsonl using the current UTC time.
-        # 2. Serialize table, rows, reason, and timestamp as one JSON line.
-        # 3. Append rather than overwrite so concurrent failures are retained.
-        # 4. Increment pipeline_dead_letter_total{source="clickhouse"}.
-        # 5. Log local-DLQ write failure without interrupting the consumer loop.
-        raise NotImplementedError
+        now = datetime.now(timezone.utc)
+        path = self._dlq_local_path / f"{now.strftime('%Y%m%d_%H')}.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Append, so concurrent failures in the same hour are all kept.
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "table": table, "rows": rows, "reason": reason,
+                    "timestamp": now.isoformat()}, default=str) + "\n")
+            PIPELINE_METRICS.dead_letter_total.labels(
+                source="clickhouse").inc()
+        except Exception as e:
+            self.logger.error("Local DLQ write failed: %s", e)
 
     async def replay_dlq(
             self, since: Optional[datetime] = None) -> Tuple[int, int]:
         """Replay eligible local DLQ files and return (succeeded, failed)."""
-        # TODO:
-        # 1. Scan JSONL files from the last seven days, additionally applying
-        #    the optional UTC since boundary.
-        # 2. Parse every stored batch and retry it through _execute_insert().
-        # 3. Count successful and failed rows/batches consistently.
-        # 4. Move a source file to data/dlq/archived/ only when every entry in
-        #    that file was replayed successfully; keep partial failures active.
-        # 5. Return aggregate (success_count, failure_count).
-        raise NotImplementedError
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        if since is not None:
+            cutoff = max(cutoff, _as_utc(since))
+
+        success_count = 0
+        failure_count = 0
+        archived_dir = self._dlq_local_path / "archived"
+        archived_dir.mkdir(parents=True, exist_ok=True)
+
+        # Only the ClickHouse batch files (YYYYMMDD_HH.jsonl) are replayable;
+        # kafka_*.jsonl holds raw payloads with no target table.
+        for path in sorted(self._dlq_local_path.glob("[0-9]*.jsonl")):
+            try:
+                file_time = datetime.strptime(
+                    path.stem, "%Y%m%d_%H").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            # The file covers one hour, so keep it when its hour ends after
+            # the cutoff.
+            if file_time + timedelta(hours=1) <= cutoff:
+                continue
+
+            file_ok = True
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    table = entry["table"]
+                    rows = entry["rows"]
+                    if table not in self.tables:
+                        raise ValueError(f"unknown table: {table}")
+                except Exception as e:
+                    # An unreadable line counts as one failed entry.
+                    file_ok = False
+                    failure_count += 1
+                    self.logger.error("DLQ entry unreadable: %s | %s", path, e)
+                    continue
+
+                try:
+                    await self._execute_insert(table, rows)
+                    success_count += len(rows)
+                except Exception as e:
+                    file_ok = False
+                    failure_count += len(rows)
+                    self.logger.error("DLQ replay failed: %s | %s", path, e)
+
+            # Archive only a fully replayed file; partial failures stay active.
+            if file_ok:
+                path.replace(archived_dir / path.name)
+
+        return (success_count, failure_count)
 
     async def shutdown(self) -> None:
         """Flush pending rows and close the ClickHouse client."""
-        # TODO:
-        # 1. Await flush_all() before closing the client.
-        # 2. Close the blocking client through asyncio.to_thread().
-        # 3. Clear self.client and set enabled=False.
-        # 4. Log shutdown failures without propagating them.
-        raise NotImplementedError
+        try:
+            await self.flush_all()
+            if self.client is not None:
+                await asyncio.to_thread(self.client.close)
+                self.logger.info("ClickHouse client closed")
+        except Exception as e:
+            self.logger.error("ClickHouse shutdown failed: %s", e)
+        finally:
+            self.client = None
+            self.enabled = False

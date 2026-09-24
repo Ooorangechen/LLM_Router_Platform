@@ -207,6 +207,20 @@ class PipelineMetrics:
             "Kafka produce attempts by topic and status",
             labelnames=["topic", "status"],)
 
+        self.clickhouse_write_total = Counter(
+            "pipeline_clickhouse_write_total", "ClickHouse batch write outcomes",
+            labelnames=["table", "status"],
+        )
+
+        self.clickhouse_write_latency_seconds = Histogram(
+            "pipeline_clickhouse_write_latency_seconds", "ClickHouse attempt latency",
+            labelnames=["table"],
+        )
+        
+        self.dead_letter_total = Counter(
+            "pipeline_dead_letter_total", "Dead-letter events", labelnames=["source"],
+        )
+
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
 INFERENCE_METRICS = InferenceMetrics()

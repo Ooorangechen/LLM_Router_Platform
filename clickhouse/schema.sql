@@ -42,7 +42,9 @@ ENGINE = ReplacingMergeTree(response_completed_at)
 PARTITION BY toYYYYMM(request_received_at)
 ORDER BY (query_id, request_received_at)
 PRIMARY KEY query_id
-TTL request_received_at + INTERVAL 90 DAY
+-- Decision: toDateTime() around the DateTime64 column. ClickHouse 23.8 (the
+-- P3 D4 version) rejects a TTL whose result is DateTime64 (BAD_TTL_EXPRESSION).
+TTL toDateTime(request_received_at) + INTERVAL 90 DAY
 SETTINGS index_granularity = 8192;
 
 -- BloomFilter index (optional: execute ALTER TABLE after table creation or inline directly)
@@ -69,7 +71,8 @@ CREATE TABLE IF NOT EXISTS system_metrics
 ENGINE = ReplacingMergeTree(timestamp)
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (service, metric_name, labels, timestamp)
-TTL timestamp + INTERVAL 30 DAY
+-- toDateTime() for the same ClickHouse 23.8 DateTime64 TTL restriction.
+TTL toDateTime(timestamp) + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
 -- ============================================================

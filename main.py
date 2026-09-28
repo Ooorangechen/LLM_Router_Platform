@@ -4,10 +4,12 @@ import json
 import time
 import signal
 import asyncio
+import functools
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from copy import deepcopy
-from typing import Union
+from typing import Optional, Union
 import click
 import yaml
 from dotenv import load_dotenv
@@ -16,11 +18,28 @@ from src.llm_router_part0_setup import setup_project_environment
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
 from src.utils.logger import setup_logging, get_logger
-from src.utils.schema import QueryRequest, UserTier
-import src.utils.metrics  
+from src.utils.schema import QueryRequest, RoutingDecision, UserTier
+import src.utils.metrics
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = str(PROJECT_ROOT / "config/config.yaml")
+
+# Decision: capture the RoutingDecision through a ContextVar wrapper around
+# router.route_query instead of changing InferenceEngine.process_query's return
+# type (P3 §I.7: connect via Hook, P2 signatures stay frozen). Each HTTP
+# request runs in its own asyncio task with its own context copy, so
+# concurrent requests never see each other's decision.
+_routing_decision: ContextVar[Optional[RoutingDecision]] = ContextVar(
+    "routing_decision", default=None)
+
+
+def _capture_routing_decision(route_query):
+    @functools.wraps(route_query)
+    async def wrapper(request):
+        decision = await route_query(request)
+        _routing_decision.set(decision)
+        return decision
+    return wrapper
 
 
 try:
@@ -128,6 +147,9 @@ class LLMRouterPlatform:
 
         if self.config.get("pipeline", {}).get("enabled", False):
             self.logger.info("Initializing PipelineManager...")
+            # Wrapped only when the pipeline is on, so pipeline.enabled=False
+            # leaves the P2 router object untouched.
+            router.route_query = _capture_routing_decision(router.route_query)
             try:
                 # Imported here so pipeline.enabled=False never loads Kafka or
                 # ClickHouse modules (P3 §3.7 core constraint).
@@ -268,6 +290,17 @@ class LLMRouterPlatform:
                 # 抓不住，进程会被直接杀掉。这里用 BaseException 才能满足「异常 500」。
                 raise HTTPException(status_code=500, detail=str(exc))
 
+        # Decision: expose /metrics on the API port. P3 §I.6 forbids new
+        # business endpoints, but M5 and §5.4 curl localhost:8080/metrics; this
+        # is an observability endpoint reading the same default registry as
+        # the optional port-8000 server. An explicit route instead of
+        # app.mount(), which redirects /metrics to /metrics/.
+        @app.get("/metrics")
+        async def metrics():
+            from fastapi import Response
+            from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+            return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
         @app.get("/admin/services")
         async def admin_services():
             return {
@@ -288,8 +321,10 @@ class LLMRouterPlatform:
                     max_tokens=payload.get("max_tokens", 512),
                     temperature=payload.get("temperature", 1.0),
                 )
-                routing_decision, resp = await self.services["inference"].process_query(
+                _routing_decision.set(None)
+                resp = await self.services["inference"].process_query(
                     query_request)
+                routing_decision = _routing_decision.get()
 
                 # ===== P3 Pipeline Hook (non-blocking) =====
                 if (

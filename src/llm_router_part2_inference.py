@@ -9,10 +9,10 @@ from time import perf_counter
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, AsyncIterator, Dict, List, Optional, TYPE_CHECKING
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.utils.schema import QueryRequest, InferenceResponse, RoutingDecision
+from src.utils.schema import QueryRequest, InferenceResponse
 from src.utils.logger import get_logger
 from src.utils.metrics import INFERENCE_METRICS
 
@@ -530,12 +530,9 @@ class InferenceEngine:
             except Exception as exc:
                 logger.warning("Provider '%s' initialization failed; skipping: %s", name, exc)
 
-    async def process_query(
-        self, request: QueryRequest,
-    ) -> Tuple[Optional[RoutingDecision], InferenceResponse]:
+    async def process_query(self, request: QueryRequest) -> InferenceResponse:
         """Route -> resolve provider -> cache lookup -> optional compression on copy
-        -> batch/provider generation -> cache write -> stats/metrics.
-        Return the routing decision with the response for P3 orchestration.
+        -> batch/provider generation -> cache write -> stats/metrics -> response.
         Cache writes use response.model_dump(mode="json") for Schema timestamps.
         Errors become InferenceResponse(error=...), per P2.
         """
@@ -543,7 +540,6 @@ class InferenceEngine:
         use_cache = self.cache.enabled
         model_name = "unknown"
         error_type = None
-        decision: Optional[RoutingDecision] = None
         try:
             decision = await self.router.route_query(request)
             model_name = decision.selected_model
@@ -552,12 +548,11 @@ class InferenceEngine:
                 cache_key = self.cache.generate_cache_key(request, model_name)
                 cached = await self.cache.get_cached_response(cache_key)
                 if cached is not None:
-                    response = InferenceResponse(**{
+                    return InferenceResponse(**{
                         **cached,
                         "cached": True,
                         "latency_ms": int((perf_counter() - start) * 1000),
                     })
-                    return decision, response
 
             compressed = False
             compressor = self.context_compressor
@@ -589,7 +584,7 @@ class InferenceEngine:
                 token_count_input=0, token_count_output=0, latency_ms=int((perf_counter() - start) * 1000),
                 tokens_per_second=0.0, cost_usd=0.0,
             )
-        # One metrics boundary avoids retrying inference when telemetry fails.
+        # One telemetry boundary keeps P2's response contract without retrying inference.
         try:
             await self._update_stats(response)
             self.router.update_model_stats(model_name, success=not response.error, latency_ms=response.latency_ms)
@@ -599,7 +594,7 @@ class InferenceEngine:
             INFERENCE_METRICS.request_duration.labels(model=model_name, provider=response.provider).observe(perf_counter() - start)
         except Exception as exc:
             logger.warning("Inference statistics update failed: %s", exc)
-        return decision, response
+        return response
 
     async def stream_query(self, request: QueryRequest) -> AsyncIterator[str]:
         """Route, resolve provider and forward text; errors yield an error string."""

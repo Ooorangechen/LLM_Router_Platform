@@ -495,7 +495,8 @@ class KafkaConsumerEngine:
                 self.logger.error("Periodic flush failed: %s", e)
 
     async def _flush_and_commit(self) -> None:
-        """Write every buffered row; commit only if all writes succeeded."""
+        """Write every buffered row; commit only if every row is durable
+        (in ClickHouse or the local DLQ)."""
         failed = 0
         for table in self.clickhouse_writer.tables:
             _, table_failed = await self.clickhouse_writer.flush_table(table)
@@ -518,7 +519,8 @@ class KafkaConsumerEngine:
             self._committed.update(offsets)
 
     def _rewind(self) -> None:
-        """P3 §3.4: a failed write is not committed and is consumed again."""
+        """Rows lost to both ClickHouse and the DLQ are not committed and are
+        consumed again."""
         # Every waiting half sits at or after its committed offset, so the
         # rewind replays it too; drop the stale copies.
         for tp, offset in self._committed.items():
@@ -526,10 +528,11 @@ class KafkaConsumerEngine:
         self._positions = dict(self._committed)
         self._pending.clear()
         self.logger.warning(
-            "ClickHouse write failed; consumer rewound to committed offsets")
+            "Rows not written or dead-lettered; consumer rewound to "
+            "committed offsets")
 
     async def _handle_message(self, topic: str, msg_value: bytes) -> bool:
-        """Buffer one message; False only when the write it triggered failed.
+        """Buffer one message; False only when the flush it triggered lost rows.
 
         A message that cannot be parsed or routed is dead-lettered and counts
         as handled, so one bad payload cannot stall its partition.
@@ -796,8 +799,15 @@ class ClickHouseWriter:
             self.logger.error(
                 "ClickHouse insert failed, batch sent to DLQ: table=%s, "
                 "rows=%d, error=%s", table, len(rows), e)
-            await self._write_to_dlq(table, rows, str(e))
-            return (0, len(rows))
+            # Decision: `failed` counts rows stored nowhere durable (neither
+            # ClickHouse nor the local DLQ). A batch persisted to the DLQ is
+            # recoverable via replay-dlq, so the consumer may commit past it
+            # instead of rewinding into an endless retry-and-dead-letter loop
+            # while ClickHouse is down. The ClickHouse failure itself is still
+            # counted by clickhouse_write_total{status="failure"} and
+            # dead_letter_total.
+            persisted = await self._write_to_dlq(table, rows, str(e))
+            return (0, 0 if persisted else len(rows))
 
     async def flush_all(self) -> None:
         """Flush every non-empty table buffer independently."""
@@ -846,8 +856,11 @@ class ClickHouseWriter:
 
     async def _write_to_dlq(
             self, table: str, rows: List[Dict[str, Any]],
-            reason: str) -> None:
-        """Append one failed ClickHouse batch to an hourly JSONL file."""
+            reason: str) -> bool:
+        """Append one failed ClickHouse batch to an hourly JSONL file.
+
+        Returns whether the batch reached disk.
+        """
         now = datetime.now(timezone.utc)
         path = self._dlq_local_path / f"{now.strftime('%Y%m%d_%H')}.jsonl"
         try:
@@ -859,8 +872,10 @@ class ClickHouseWriter:
                     "timestamp": now.isoformat()}, default=str) + "\n")
             PIPELINE_METRICS.dead_letter_total.labels(
                 source="clickhouse").inc()
+            return True
         except Exception as e:
             self.logger.error("Local DLQ write failed: %s", e)
+            return False
 
     async def replay_dlq(
             self, since: Optional[datetime] = None) -> Tuple[int, int]:
@@ -942,6 +957,11 @@ class PipelineManager:
         self.ch_writer = ClickHouseWriter(config)
         self.consumer = KafkaConsumerEngine(
             config, self.ch_writer, self.producer)
+        # Pre-create labelled series so /metrics shows them at 0 before any
+        # failure; done here, not in metrics.py, so pipeline.enabled=False
+        # exposes no pipeline series.
+        for source in ("clickhouse", "kafka"):
+            PIPELINE_METRICS.dead_letter_total.labels(source=source)
 
     async def initialize(self) -> None:
         if not self.enabled:

@@ -4,9 +4,12 @@ import json
 import time
 import signal
 import asyncio
+import functools
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from copy import deepcopy
-from typing import Union
+from typing import Optional, Union
 import click
 import yaml
 from dotenv import load_dotenv
@@ -15,12 +18,28 @@ from src.llm_router_part0_setup import setup_project_environment
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
 from src.utils.logger import setup_logging, get_logger
-from src.utils.constants import KafkaTopics
-from src.utils.schema import QueryRequest, UserTier
-import src.utils.metrics  
+from src.utils.schema import QueryRequest, RoutingDecision, UserTier
+import src.utils.metrics
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = str(PROJECT_ROOT / "config/config.yaml")
+
+# Decision: capture the RoutingDecision through a ContextVar wrapper around
+# router.route_query instead of changing InferenceEngine.process_query's return
+# type (P3 §I.7: connect via Hook, P2 signatures stay frozen). Each HTTP
+# request runs in its own asyncio task with its own context copy, so
+# concurrent requests never see each other's decision.
+_routing_decision: ContextVar[Optional[RoutingDecision]] = ContextVar(
+    "routing_decision", default=None)
+
+
+def _capture_routing_decision(route_query):
+    @functools.wraps(route_query)
+    async def wrapper(request):
+        decision = await route_query(request)
+        _routing_decision.set(decision)
+        return decision
+    return wrapper
 
 
 try:
@@ -119,12 +138,31 @@ class LLMRouterPlatform:
         setup_logging(**kwargs)
 
     async def _initialize_services(self):
-        """Initialize the modular P2 router and inference services."""
+        """Initialize router, optional P3 pipeline, then inference."""
         self.logger.info("Initializing LLM Router Platform services...")
 
         router = ModelRouter(self.config["router"])
         await router.initialize()
         self.services["router"] = router
+
+        if self.config.get("pipeline", {}).get("enabled", False):
+            self.logger.info("Initializing PipelineManager...")
+            # Wrapped only when the pipeline is on, so pipeline.enabled=False
+            # leaves the P2 router object untouched.
+            router.route_query = _capture_routing_decision(router.route_query)
+            try:
+                # Imported here so pipeline.enabled=False never loads Kafka or
+                # ClickHouse modules (P3 §3.7 core constraint).
+                from src.llm_router_part3_pipeline import PipelineManager
+
+                pipeline = PipelineManager(self.config)
+                await pipeline.initialize()
+                await pipeline.start_consumer()
+                self.services["pipeline"] = pipeline
+            except Exception as exc:
+                self.logger.warning("Pipeline initialization skipped: %s", exc)
+        else:
+            self.logger.info("Pipeline disabled by config")
 
         inference = InferenceEngine(self.config["inference"], router=router)
         await inference.initialize()
@@ -162,7 +200,12 @@ class LLMRouterPlatform:
         for name in reversed(list(self.services.keys())):
             self.logger.info(f"Stopping services: {name}")
             service = self.services[name]
-            if hasattr(service, "shutdown"):
+            if name == "pipeline":
+                # P3 §3.7: stop consuming, flush buffers, then close clients.
+                await service.stop_consumer()
+                await service.flush_all()
+                await service.shutdown()
+            elif hasattr(service, "shutdown"):
                 await service.shutdown()
         self.services.clear()
         self.logger.info("Shutdown complete")
@@ -247,6 +290,17 @@ class LLMRouterPlatform:
                 # 抓不住，进程会被直接杀掉。这里用 BaseException 才能满足「异常 500」。
                 raise HTTPException(status_code=500, detail=str(exc))
 
+        # Decision: expose /metrics on the API port. P3 §I.6 forbids new
+        # business endpoints, but M5 and §5.4 curl localhost:8080/metrics; this
+        # is an observability endpoint reading the same default registry as
+        # the optional port-8000 server. An explicit route instead of
+        # app.mount(), which redirects /metrics to /metrics/.
+        @app.get("/metrics")
+        async def metrics():
+            from fastapi import Response
+            from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+            return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
         @app.get("/admin/services")
         async def admin_services():
             return {
@@ -257,6 +311,7 @@ class LLMRouterPlatform:
         @app.post("/route")
         async def route_query(request: Request):
             try:
+                request_received_at = datetime.now(timezone.utc)
                 payload = await request.json()
                 query_request = QueryRequest(
                     query=payload.get("query"),
@@ -266,25 +321,45 @@ class LLMRouterPlatform:
                     max_tokens=payload.get("max_tokens", 512),
                     temperature=payload.get("temperature", 1.0),
                 )
-                response = await self.services["inference"].process_query(query_request)
-                if response.error:
-                    raise RuntimeError(response.error)
+                _routing_decision.set(None)
+                resp = await self.services["inference"].process_query(
+                    query_request)
+                routing_decision = _routing_decision.get()
+
+                # ===== P3 Pipeline Hook (non-blocking) =====
+                if (
+                    routing_decision is not None
+                    and "pipeline" in self.services
+                    and self.services["pipeline"].enabled
+                ):
+                    asyncio.create_task(
+                        self.services["pipeline"].publish_pipeline_events(
+                            request=query_request,
+                            routing_decision=routing_decision,
+                            inference_response=resp,
+                            received_at=request_received_at,
+                        )
+                    )
+                # ===== End P3 Hook =====
+
+                if resp.error:
+                    raise RuntimeError(resp.error)
 
                 src.utils.metrics.SYSTEM_METRICS.requests_total.labels(
                     endpoint="/route", method="POST", status="200"
                 ).inc()
                 return {
                     "query_id": str(query_request.request_id),
-                    "response": response.response_text,
-                    "model_name": response.model_name,
+                    "response": resp.response_text,
+                    "model_name": resp.model_name,
                     "tokens": {
-                        "input": response.token_count_input,
-                        "output": response.token_count_output,
-                        "total": response.total_tokens,
+                        "input": resp.token_count_input,
+                        "output": resp.token_count_output,
+                        "total": resp.total_tokens,
                     },
-                    "cost_usd": response.cost_usd,
-                    "latency_ms": response.latency_ms,
-                    "cached": response.cached,
+                    "cost_usd": resp.cost_usd,
+                    "latency_ms": resp.latency_ms,
+                    "cached": resp.cached,
                 }
             except Exception as exc:
                 src.utils.metrics.SYSTEM_METRICS.errors_total.labels(
@@ -396,18 +471,13 @@ async def _init_kafka_topics(config: dict) -> tuple[int, int]:
     from aiokafka.admin import AIOKafkaAdminClient, NewTopic
     from aiokafka.errors import TopicAlreadyExistsError
     kafka_config = config["kafka"]
-    topics_path = Path(__file__).resolve().parent / kafka_config["topics_file"]
+    topics_path = PROJECT_ROOT / kafka_config["topics_file"]
     with topics_path.open(encoding="utf-8") as file:
         topics = json.load(file)["topics"]
-    configured_names = kafka_config.get("topics", {})
-    logical_keys = {topic.value: topic.name.lower() for topic in KafkaTopics}
 
     definitions = [
         NewTopic(
-            name=configured_names.get(
-                logical_keys.get(item["name"], item["name"]),
-                item["name"],
-            ),
+            name=item["name"],
             num_partitions=item["partitions"],
             replication_factor=kafka_config.get("replication_factor", item["replication_factor"]),
             topic_configs={
@@ -447,17 +517,80 @@ async def _init_kafka_topics(config: dict) -> tuple[int, int]:
 
 
 @cli.command(name="init-kafka-topics")
-@click.option("--config", "config_path", default=CONFIG_PATH, show_default=True)
-def init_kafka_topics(config_path):
-    """Create Kafka topics defined in topics.json without starting app services."""
+def init_kafka_topics():
+    """Create Kafka topics defined in kafka/topics.json."""
     try:
-        platform = LLMRouterPlatform(config_path)
+        platform = LLMRouterPlatform()
         created, existing = asyncio.run(
             _init_kafka_topics(platform.config)
         )
-        click.echo(f"Created {created} topics; {existing} already exist.")
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
+    
+    if created:
+        click.echo(f"Created {created} topics")
+    if existing:
+        click.echo(f"{existing} topics already exist")
+
+
+def _clickhouse_writer():
+    """Build a ClickHouseWriter for the CLI commands.
+
+    The writer only connects when pipeline.enabled is true, which defaults to
+    false; these commands target ClickHouse explicitly, so enable it here.
+    """
+    from src.llm_router_part3_pipeline import ClickHouseWriter
+    config = deepcopy(LLMRouterPlatform().config)
+    config.setdefault("pipeline", {})["enabled"] = True
+    return ClickHouseWriter(config)
+
+
+async def _replay_dlq(since):
+    writer = _clickhouse_writer()
+    await writer.initialize()
+    if not writer.enabled:
+        raise RuntimeError("ClickHouse not available")
+    try:
+        return await writer.replay_dlq(since)
+    finally:
+        await writer.shutdown()
+
+
+@cli.command(name="replay-dlq")
+@click.option("--since", default=None, help="Replay DLQ entries since ISO date (e.g. 2026-08-01)")
+def replay_dlq(since):
+    """Replay local dead-letter queue to ClickHouse."""
+    try:
+        since_dt = datetime.fromisoformat(since) if since else None
+        succeeded, failed = asyncio.run(_replay_dlq(since_dt))
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Replayed {succeeded + failed} entries, {succeeded} succeeded, {failed} failed")
+
+
+async def _init_clickhouse_schema():
+    # initialize() connects and runs schema.sql once; it keeps the counts.
+    writer = _clickhouse_writer()
+    await writer.initialize()
+    if not writer.enabled:
+        raise RuntimeError("ClickHouse not available")
+    try:
+        return writer.schema_result
+    finally:
+        await writer.shutdown()
+
+
+@cli.command(name="init-clickhouse-schema")
+def init_clickhouse_schema():
+    """Execute clickhouse/schema.sql DDL."""
+    try:
+        succeeded, failed = asyncio.run(_init_clickhouse_schema())
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    if failed:
+        raise click.ClickException(
+            f"Executed {succeeded + failed} DDL statements, {failed} errors")
+    click.echo(f"Executed {succeeded} DDL statements, no errors")
 
 if __name__ == "__main__":
     cli()

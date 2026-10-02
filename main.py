@@ -29,10 +29,9 @@ CONFIG_PATH = str(PROJECT_ROOT / "config/config.yaml")
 # type (P3 §I.7: connect via Hook, P2 signatures stay frozen). Each HTTP
 # request runs in its own asyncio task with its own context copy, so
 # concurrent requests never see each other's decision.
+
 _routing_decision: ContextVar[Optional[RoutingDecision]] = ContextVar(
     "routing_decision", default=None)
-
-
 def _capture_routing_decision(route_query):
     @functools.wraps(route_query)
     async def wrapper(request):
@@ -43,7 +42,7 @@ def _capture_routing_decision(route_query):
 
 
 try:
-    from prometheus_client import start_http_server
+    from prometheus_client import make_asgi_app, start_http_server
     _PROM_AVAILABLE = True
 except Exception:
     _PROM_AVAILABLE = False
@@ -51,10 +50,7 @@ except Exception:
 
 class LLMRouterPlatform:
     """
-    P1: 
-        load config, 
-        initialize logging, 
-        initializeing service structure
+    load config, initialize logging,  initializeing service structure
     """
 
     def __init__(self, config_path: Union[str, Path] = CONFIG_PATH):
@@ -62,6 +58,7 @@ class LLMRouterPlatform:
         load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
         self.config = self._load_config()
         self.services = {}
+        self._prom_server = None
         self._setup_logging()
         self.logger = get_logger(__name__)
 
@@ -147,14 +144,10 @@ class LLMRouterPlatform:
 
         if self.config.get("pipeline", {}).get("enabled", False):
             self.logger.info("Initializing PipelineManager...")
-            # Wrapped only when the pipeline is on, so pipeline.enabled=False
-            # leaves the P2 router object untouched.
+            # pipeline.enabled=False leaves the P2 router object untouched.
             router.route_query = _capture_routing_decision(router.route_query)
             try:
-                # Imported here so pipeline.enabled=False never loads Kafka or
-                # ClickHouse modules (P3 §3.7 core constraint).
                 from src.llm_router_part3_pipeline import PipelineManager
-
                 pipeline = PipelineManager(self.config)
                 await pipeline.initialize()
                 await pipeline.start_consumer()
@@ -168,22 +161,29 @@ class LLMRouterPlatform:
         await inference.initialize()
         self.services["inference"] = inference
 
+        # P4 Mode B: standalone Prometheus HTTP server
+        monitoring_cfg = self.config.get("monitoring", {})
+        prom_server_cfg = monitoring_cfg.get("prometheus_server", {})
+        if (
+            _PROM_AVAILABLE
+            and monitoring_cfg.get("enabled", False)
+            and prom_server_cfg.get("enabled", False)
+            and self._prom_server is None
+        ):
+            port = prom_server_cfg.get("port", 9101)
+            addr = prom_server_cfg.get("addr", "0.0.0.0")
+            try:
+                self._prom_server, _ = start_http_server(port=port, addr=addr)
+                self.logger.info("Prometheus HTTP server started on :%d", port)
+            except Exception as exc:
+                self.logger.warning(
+                    "Prometheus HTTP server not started on :%d: %s", port, exc)
+
         self.logger.info("All services initialized successfully")
 
     async def _start_services(self):
         import uvicorn
         app = self._create_fastapi_app()
-
-        monitoring_cfg = self.config.get("monitoring", {})
-        if monitoring_cfg.get("enabled", False):
-            if not _PROM_AVAILABLE:
-                self.logger.warning("Prometheus metrics are enabled but prometheus_client is unavailable")
-            else:
-                try:
-                    prom_port = monitoring_cfg.get("prometheus_port", 8000)
-                    start_http_server(prom_port)
-                except Exception as e:
-                    self.logger.warning(f"Prometheus metrics server failed to start: {e} ")
 
         api_cfg = self.config.get("api", {})
         host = api_cfg.get("host", "0.0.0.0")
@@ -201,13 +201,20 @@ class LLMRouterPlatform:
             self.logger.info(f"Stopping services: {name}")
             service = self.services[name]
             if name == "pipeline":
-                # P3 §3.7: stop consuming, flush buffers, then close clients.
+                # stop consuming, flush buffers, then close clients.
                 await service.stop_consumer()
                 await service.flush_all()
                 await service.shutdown()
             elif hasattr(service, "shutdown"):
                 await service.shutdown()
         self.services.clear()
+
+        if self._prom_server is not None:
+            self._prom_server.shutdown()
+            self._prom_server.server_close()
+            self._prom_server = None
+            self.logger.info("Prometheus HTTP server stopped")
+            
         self.logger.info("Shutdown complete")
 
     def _signal_handler(self, signum, frame):
@@ -233,6 +240,12 @@ class LLMRouterPlatform:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+        # P4 Mode A: mount /metrics on the API port (default on).
+        metrics_expose_cfg = self.config.get("monitoring", {}).get("metrics_expose", {})
+        if _PROM_AVAILABLE and metrics_expose_cfg.get("use_fastapi_mount", True):
+            app.mount("/metrics", make_asgi_app())
+            self.logger.info("Mounted /metrics via make_asgi_app")
 
         @app.get("/health")
         async def health():
@@ -290,17 +303,6 @@ class LLMRouterPlatform:
                 # 抓不住，进程会被直接杀掉。这里用 BaseException 才能满足「异常 500」。
                 raise HTTPException(status_code=500, detail=str(exc))
 
-        # Decision: expose /metrics on the API port. P3 §I.6 forbids new
-        # business endpoints, but M5 and §5.4 curl localhost:8080/metrics; this
-        # is an observability endpoint reading the same default registry as
-        # the optional port-8000 server. An explicit route instead of
-        # app.mount(), which redirects /metrics to /metrics/.
-        @app.get("/metrics")
-        async def metrics():
-            from fastapi import Response
-            from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-            return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
         @app.get("/admin/services")
         async def admin_services():
             return {
@@ -326,7 +328,7 @@ class LLMRouterPlatform:
                     query_request)
                 routing_decision = _routing_decision.get()
 
-                # ===== P3 Pipeline Hook (non-blocking) =====
+                # P3 Pipeline Hook (non-blocking)
                 if (
                     routing_decision is not None
                     and "pipeline" in self.services
@@ -340,14 +342,17 @@ class LLMRouterPlatform:
                             received_at=request_received_at,
                         )
                     )
-                # ===== End P3 Hook =====
+                # End P3 Hook
 
                 if resp.error:
                     raise RuntimeError(resp.error)
 
-                src.utils.metrics.SYSTEM_METRICS.requests_total.labels(
-                    endpoint="/route", method="POST", status="200"
-                ).inc()
+                try:
+                    src.utils.metrics.SYSTEM_METRICS.requests_total.labels(
+                        endpoint="/route", method="POST", status="200"
+                    ).inc()
+                except Exception as metric_exc:
+                    self.logger.debug("requests_total write failed: %s", metric_exc)
                 return {
                     "query_id": str(query_request.request_id),
                     "response": resp.response_text,
@@ -362,9 +367,12 @@ class LLMRouterPlatform:
                     "cached": resp.cached,
                 }
             except Exception as exc:
-                src.utils.metrics.SYSTEM_METRICS.errors_total.labels(
-                    component="api", error_type=type(exc).__name__
-                ).inc()
+                try:
+                    src.utils.metrics.SYSTEM_METRICS.errors_total.labels(
+                        component="api", error_type=type(exc).__name__
+                    ).inc()
+                except Exception as metric_exc:
+                    self.logger.debug("errors_total write failed: %s", metric_exc)
                 raise HTTPException(status_code=500, detail=str(exc))
 
         return app

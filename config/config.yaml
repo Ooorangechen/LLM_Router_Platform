@@ -204,17 +204,20 @@ clickhouse:
 
 monitoring:
   enabled: false
-  alter_enabled: true
-  resource_collector: 
+  alert_enabled: true
+  resource_collector:
     enabled: true
     interval_sec: 15
     disk_path: /
-    net_iface: null # null means sum of all
-  interface:
+    net_iface: null # null means sum of all interfaces
     gpu_enabled: true
-  
-  prometheus_port: 8000
 
+  prometheus_server:
+    enabled: false # disabled by default, use mode A /metrics
+    port: 9101
+    addr: 0.0.0.0
+  metrics_expose:
+    use_fastapi_mount: true # app.mount("/metrics")
   prometheus:
     scrape_interval_seconds: 15
   

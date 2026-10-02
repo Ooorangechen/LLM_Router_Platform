@@ -1,6 +1,5 @@
-# Prometheus 指标类
-# SystemMetrics / RouterMetrics / InferenceMetrics / PipelineMetrics四件套
-# P1 只做到实例化，定义类型，先不进行业务埋点
+# Prometheus metrics
+# SystemMetrics / RouterMetrics / InferenceMetrics / PipelineMetrics
 
 try:
     from prometheus_client import Counter, Gauge, Histogram, Info, Enum
@@ -32,7 +31,7 @@ class SystemMetrics:
         self.requests_total = Counter("llm_router_requests_total", 
                                       "total requests received", 
                                       ["endpoint", "method", "status"])
-        self.request_duration = Histogram("llm_router_request_duration_seconds", 
+        self.request_duration_seconds = Histogram("llm_router_request_duration_seconds", 
                                           "HTTP request duration",
                                           labelnames=["endpoint", "method"],
                                           buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0,float("inf")],
@@ -69,7 +68,6 @@ class SystemMetrics:
         self.health_status = Enum("llm_router_health_status",
                                   "overall platform health status",
                                   states=["healthy", "degraded", "unhealthy"])
-
 class RouterMetrics:
     """
     Routing Metrics used for routing module. 
@@ -77,9 +75,9 @@ class RouterMetrics:
     def __init__(self):
         self.routing_decisions = Counter("llm_router_router_routing_decisions_total", 
                                          "number of routing decision made",
-                                         labelnames=["model", "query_type"])
+                                         labelnames=["selected_model", "query_type", "strategy"])
 
-        self.routing_duration = Histogram(
+        self.routing_duration_seconds = Histogram(
             "llm_router_router_routing_duration_seconds",
             "Routing decision duration in seconds",
             buckets=[
@@ -98,6 +96,14 @@ class RouterMetrics:
             ],
         )
 
+        self.routing_latency_seconds = Histogram("llm_router_router_routing_latency_seconds",
+                                                 "routing latency seconds",
+                                                 labelnames=['strategy'])
+
+        self.routing_fallbacks_total = Counter("llm_router_router_routing_fallbacks_total",
+                                               "total number of routing fallbacks",
+                                               labelnames=['cause'])
+        
         self.routing_confidence = Histogram("llm_router_router_routing_confidence",
                                             "routing confidence level", 
                                             labelnames=["model", "query_type"],
@@ -124,25 +130,37 @@ class InferenceMetrics:
     def __init__(self):
         self.requests_total = Counter("llm_router_inference_requests_total",
                                       "total number of inference requests",
-                                      labelnames=["model", "provider"])
-        self.request_duration = Histogram("llm_router_inference_request_duration_seconds", 
+                                      labelnames=["model_name", "provider", "status"])
+        
+        self.request_duration_seconds = Histogram("llm_router_inference_request_duration_seconds", 
                                            "inference requests duration",
-                                           labelnames=["model","provider"],
+                                           labelnames=["model_name","provider"],
                                            buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, float("inf")]
                                            )
+        
+        self.tokens_input_total =  Counter("llm_router_inference_tokens_input_total",
+                                  "total number of input tokens used in inference",
+                                  labelnames=["model_name"])
+
+        self.tokens_output_total =  Counter("llm_router_inference_tokens_output_total",
+                                  "total number of output tokens used in inference",
+                                  labelnames=["model_name"])
 
         self.tokens_total = Counter("llm_router_inference_tokens_total",
-                                  "total number of tokens used in inference",
-                                  labelnames=["model","direction"])
+                                  "total number of all tokens used in inference",
+                                  labelnames=["model_name"])
 
         self.cost_usd_total = Counter("llm_router_inference_cost_usd_total",
                                        "total inference cost in usd",
-                                       labelnames=["model"])
+                                       labelnames=["model_name"])
 
         self.cache_hits = Counter("llm_router_inference_cache_hits_total",
-                                  "total number of inference cache hits")
+                                  "total number of inference cache hits",
+                                  labelnames=["model_name"])
+        
         self.cache_misses = Counter("llm_router_inference_cache_misses_total",
-                                    "total number of inference cache misses")
+                                    "total number of inference cache misses",
+                                    labelnames=["model_name"])
 
         self.compressions_total = Counter("llm_router_inference_compressions_total",
                                           "total number of inference compressions",
@@ -150,7 +168,7 @@ class InferenceMetrics:
 
         self.errors_total = Counter("llm_router_inference_errors_total",
                                     "total number of inference errors",
-                                    labelnames=["model","error_type"])        
+                                    labelnames=["model_name","error_type"])        
 
         self.batch_sizes = Histogram("llm_router_inference_batch_sizes",
                                      "inference batch sizes",
@@ -203,28 +221,156 @@ class PipelineMetrics:
                                   labelnames=["topic", "partition"])
 
         self.kafka_produce_total = Counter(
-            "pipeline_kafka_produce_total",
+            "llm_router_pipeline_kafka_produce_total",
             "Kafka produce attempts by topic and status",
             labelnames=["topic", "status"],)
 
+        self.kafka_consume_total = Counter(
+            "llm_router_pipeline_kafka_consume_total",
+            "Kafka consume attempts by topic and status",
+            labelnames=["topic", "status"],)
+
         self.clickhouse_write_total = Counter(
-            "pipeline_clickhouse_write_total", "ClickHouse batch write outcomes",
+            "llm_router_pipeline_clickhouse_write_total", 
+            "ClickHouse batch write outcomes",
             labelnames=["table", "status"],
         )
 
         self.clickhouse_write_latency_seconds = Histogram(
-            "pipeline_clickhouse_write_latency_seconds", "ClickHouse attempt latency",
+            "llm_router_pipeline_clickhouse_write_latency_seconds", 
+            "ClickHouse attempt latency",
             labelnames=["table"],
         )
-        
+
+        # keeps the "pipeline_" segment like the rest of this class; P4 §3.3 sample
+        # llm_router_dead_letter_total is rewritten to this name in alert_rules.yml
         self.dead_letter_total = Counter(
-            "pipeline_dead_letter_total", "Dead-letter events", labelnames=["source"],
+            "llm_router_pipeline_dead_letter_total",
+            "Dead-letter events", 
+            labelnames=["source", "reason"],
         )
+
+
+class ResourceMetrics:
+    """Resource collector metrics"""
+    # all names use llm_router_resource_<field>, matching the llm_router_<category>_<field> convention;
+    # P4 §3.3 samples (llm_router_memory_percent / llm_router_disk_percent) are rewritten in alert_rules.yml
+
+    def __init__(self):
+        self.cpu_percent = Gauge(
+            "llm_router_resource_cpu_percent",
+            "Current cpu percentage"
+        )
+        self.memory_percent = Gauge(
+            "llm_router_resource_memory_percent",
+            "current ram percentage"
+        )
+        self.memory_used_bytes = Gauge(
+            "llm_router_resource_memory_used_bytes",
+            "current used ram in bytes"
+        )
+        self.memory_total_bytes = Gauge(
+            "llm_router_resource_memory_total_bytes",
+            "current total ram in bytes"
+        )
+
+        self.disk_percent = Gauge(
+            "llm_router_resource_disk_percent",
+            "current disk percentage"
+        )
+        self.disk_used_bytes = Gauge(
+            "llm_router_resource_disk_used_bytes",
+            "current disk used in bytes"
+        )
+
+        self.disk_total_bytes = Gauge(
+            "llm_router_resource_disk_total_bytes",
+            "current total disk in bytes"
+        )
+
+        self.gpu_count = Gauge(
+            "llm_router_resource_gpu_count",
+            "current gpu count numbers"
+        )
+        self.gpu_utilization_percent = Gauge(
+            "llm_router_resource_gpu_utilization_percent",
+            "gpu utilization percentage by gpu id",
+            labelnames=["gpu_id"]
+        )
+        self.gpu_memory_percent = Gauge(
+            "llm_router_resource_gpu_memory_percent",
+            "gpu memory percentage by gpu id",
+            labelnames=["gpu_id"]
+        )
+
+        self.net_recv_bytes_per_sec = Gauge(
+            "llm_router_resource_net_recv_bytes_per_sec",
+            "average net receving in bytes per seconds"
+        )
+        self.net_send_bytes_per_sec = Gauge(
+            "llm_router_resource_net_send_bytes_per_sec",
+            "average net sent in bytes per seconds"
+        )
+
+        self.process_count = Gauge(
+            "llm_router_resource_process_count",
+            "current process numbers"
+        )
+        self.open_fds_count = Gauge(
+            "llm_router_resource_open_fds_count",
+            "current open fds numbers"
+        )
+
+        self.uptime_seconds = Gauge(
+            "llm_router_resource_uptime_seconds",
+            "resrouce collector uptimes in seconds"
+        )
+
+
+class AlertMetrics:
+    def __init__(self):
+        self.alerts_total = Counter(
+            "llm_router_alert_alerts_total",
+            "total alert events",
+            labelnames=["rule_name", "severity", "action"]
+        )
+        self.active_alerts = Gauge(
+            "llm_router_alert_active_alerts",
+            "current active alerts number",
+            labelnames=["severity"]
+        )
+        self.notifications_total = Counter(
+            "llm_router_alert_notifications_total",
+            "total notification number",
+            labelnames=["channel", "status"]
+        )
+
+
+class HealthMetrics:
+    def __init__(self):
+        # Info appends "_info" on export -> llm_router_health_service_health_info
+        self.service_health_info = Info(
+            "llm_router_health_service_health",
+            "service health infomation",
+            labelnames=["service_name", "status", "message"]
+        )
+        self.overall_health_status = Gauge(
+            "llm_router_health_overall_health_status",
+            "current overall health status"
+        )
+
+
 
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
 INFERENCE_METRICS = InferenceMetrics()
 PIPELINE_METRICS = PipelineMetrics()
+
+# P4 added, resource colelctor & alert module
+RESOURCE_METRICS = ResourceMetrics()
+HEALTH_METRICS = HealthMetrics()
+ALERT_METRICS = AlertMetrics()
+
 # create once, then prometheus will register to the global.
 # load once at creation, then all the other modules share the same default registry
 
@@ -233,4 +379,5 @@ if __name__ == "__main__":
     print("RouterMetrics:", ROUTER_METRICS)
     print("InferenceMetrics:", INFERENCE_METRICS)
     print("PipelineMetrics:", PIPELINE_METRICS)
+    print("")
     print("All metrics instantiated without error.")

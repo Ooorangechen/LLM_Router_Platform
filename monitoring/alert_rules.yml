@@ -1,0 +1,47 @@
+groups:
+  - name: llm-router.rules
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (model_name) (rate(
+            {__name__=~"llm_router_inference_requests_total|inference_requests_total", status="error"}[5m]
+          ))
+          /
+          sum by (model_name) (rate(
+            {__name__=~"llm_router_inference_requests_total|inference_requests_total"}[5m]
+          ))
+          > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          team: llm-platform
+        annotations:
+          summary: "High error rate (>5%)"
+          description: "model {{ $labels.model_name }} error rate {{ $value | humanizePercentage }}"
+
+      - alert: HighLatencyP95
+        expr: histogram_quantile(0.95, sum by (le,model_name) (rate(llm_router_inference_request_duration_seconds_bucket[5m]))) > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "P95 latency > 5s per model"
+          description: "model {{ $labels.model_name }} p95={{ $value }}s"
+
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes / on (job) group_left() machine_memory_bytes > 0.9
+              or llm_router_resource_memory_percent > 90
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "Memory usage > 90%" }
+
+      - alert: HighDiskUsage
+        expr: llm_router_resource_disk_percent > 80
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Disk usage > 80%" }
+
+      - alert: PipelineDLQAccumulating
+        expr: increase(llm_router_pipeline_dead_letter_total[10m]) > 10
+        for: 3m
+        labels: { severity: critical }
+        annotations: { summary: "Pipeline dead-letter accumulating" }

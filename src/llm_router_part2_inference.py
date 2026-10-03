@@ -220,17 +220,20 @@ class ResponseCache:
             self.enabled = False
             logger.warning("Redis initialization failed; cache disabled: %s", exc)
 
-    async def get_cached_response(self, cache_key: str) -> Optional[Dict[str, Any]]:
-        """GET and decode JSON; count hits/misses; disabled/errors return None."""
+    async def get_cached_response(self, cache_key: str, model_name: str) -> Optional[Dict[str, Any]]:
+        """GET and decode JSON; count hits/misses; disabled/errors return None.
+        model_name is passed in (not derivable from the hashed cache_key) so the
+        hit/miss counters can be broken down by model, matching their definitions.
+        """
         if not self.enabled:
             return None
         try:
             value = await self.redis_client.get(cache_key)
             if value is None:
-                INFERENCE_METRICS.cache_misses.inc()
+                INFERENCE_METRICS.cache_misses.labels(model_name=model_name).inc()
                 return None
             response = json.loads(value)
-            INFERENCE_METRICS.cache_hits.inc()
+            INFERENCE_METRICS.cache_hits.labels(model_name=model_name).inc()
             return response
         except Exception as exc:
             logger.warning("Redis cache read failed: %s", exc)
@@ -546,7 +549,7 @@ class InferenceEngine:
             model_name, provider = self._resolve_available_model(model_name)
             if use_cache:
                 cache_key = self.cache.generate_cache_key(request, model_name)
-                cached = await self.cache.get_cached_response(cache_key)
+                cached = await self.cache.get_cached_response(cache_key, model_name)
                 if cached is not None:
                     return InferenceResponse(**{
                         **cached,
@@ -584,14 +587,13 @@ class InferenceEngine:
                 token_count_input=0, token_count_output=0, latency_ms=int((perf_counter() - start) * 1000),
                 tokens_per_second=0.0, cost_usd=0.0,
             )
-        # One telemetry boundary keeps P2's response contract without retrying inference.
         try:
             await self._update_stats(response)
             self.router.update_model_stats(model_name, success=not response.error, latency_ms=response.latency_ms)
             if error_type:
-                INFERENCE_METRICS.errors_total.labels(model=model_name, error_type=error_type).inc()
-            INFERENCE_METRICS.requests_total.labels(model=model_name, provider=response.provider).inc()
-            INFERENCE_METRICS.request_duration.labels(model=model_name, provider=response.provider).observe(perf_counter() - start)
+                INFERENCE_METRICS.errors_total.labels(model_name=model_name, error_type=error_type).inc()
+            INFERENCE_METRICS.requests_total.labels(model_name=model_name,provider=response.provider,status="error" if response.error else "success",).inc()
+            INFERENCE_METRICS.request_duration_seconds.labels(model_name=model_name, provider=response.provider).observe(perf_counter() - start)
         except Exception as exc:
             logger.warning("Inference statistics update failed: %s", exc)
         return response
@@ -631,9 +633,10 @@ class InferenceEngine:
         stats["total_tokens"] += response.token_count_input + response.token_count_output
         stats["total_cost_usd"] += response.cost_usd
         stats["total_latency_ms"] += response.latency_ms
-        for direction, count in (("input", response.token_count_input), ("output", response.token_count_output)):
-            INFERENCE_METRICS.tokens_total.labels(model=response.model_name, direction=direction).inc(count)
-        INFERENCE_METRICS.cost_usd_total.labels(model=response.model_name).inc(response.cost_usd)
+        INFERENCE_METRICS.tokens_input_total.labels(model_name=response.model_name).inc(response.token_count_input)
+        INFERENCE_METRICS.tokens_output_total.labels(model_name=response.model_name).inc(response.token_count_output)
+        INFERENCE_METRICS.tokens_total.labels(model_name=response.model_name).inc(response.token_count_input + response.token_count_output)
+        INFERENCE_METRICS.cost_usd_total.labels(model_name=response.model_name).inc(response.cost_usd)
 
     def get_health_status(self) -> Dict[str, Any]:
         """Aggregate provider health, enabled cache/compression and engine stats."""

@@ -623,7 +623,8 @@ class KafkaConsumerEngine:
                     handle.write(entry.model_dump_json() + "\n")
             except Exception as write_error:
                 self.logger.error("Local DLQ write failed: %s", write_error)
-            PIPELINE_METRICS.dead_letter_total.labels(source="kafka").inc()
+            PIPELINE_METRICS.dead_letter_total.labels(
+                source="kafka", reason="handler_error").inc()
             self.logger.error("Message sent to DLQ: topic=%s, error=%s", topic, e)
             return True
 
@@ -871,7 +872,7 @@ class ClickHouseWriter:
                     "table": table, "rows": rows, "reason": reason,
                     "timestamp": now.isoformat()}, default=str) + "\n")
             PIPELINE_METRICS.dead_letter_total.labels(
-                source="clickhouse").inc()
+                source="clickhouse", reason="clickhouse_write_failed").inc()
             return True
         except Exception as e:
             self.logger.error("Local DLQ write failed: %s", e)
@@ -957,11 +958,11 @@ class PipelineManager:
         self.ch_writer = ClickHouseWriter(config)
         self.consumer = KafkaConsumerEngine(
             config, self.ch_writer, self.producer)
-        # Pre-create labelled series so /metrics shows them at 0 before any
-        # failure; done here, not in metrics.py, so pipeline.enabled=False
-        # exposes no pipeline series.
-        for source in ("clickhouse", "kafka"):
-            PIPELINE_METRICS.dead_letter_total.labels(source=source)
+        for source, reason in (
+            ("clickhouse", "clickhouse_write_failed"),
+            ("kafka", "handler_error"),
+        ):
+            PIPELINE_METRICS.dead_letter_total.labels(source=source, reason=reason)
 
     async def initialize(self) -> None:
         if not self.enabled:

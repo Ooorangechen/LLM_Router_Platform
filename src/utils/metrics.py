@@ -1,6 +1,6 @@
 # Prometheus metrics
 # SystemMetrics / RouterMetrics / InferenceMetrics / PipelineMetrics
-
+# naming convention: llm_router_{field}_{details}
 try:
     from prometheus_client import Counter, Gauge, Histogram, Info, Enum
     PROM_AVAILABLE = True
@@ -173,7 +173,6 @@ class InferenceMetrics:
         self.batch_sizes = Histogram("llm_router_inference_batch_sizes",
                                      "inference batch sizes",
                                      buckets=[1,2,4,8,16,32,64,128,float("inf")])
-        # what's the proper design on batch size buckets? 
 
 class PipelineMetrics:
     """
@@ -242,8 +241,6 @@ class PipelineMetrics:
             labelnames=["table"],
         )
 
-        # keeps the "pipeline_" segment like the rest of this class; P4 §3.3 sample
-        # llm_router_dead_letter_total is rewritten to this name in alert_rules.yml
         self.dead_letter_total = Counter(
             "llm_router_pipeline_dead_letter_total",
             "Dead-letter events", 
@@ -253,9 +250,6 @@ class PipelineMetrics:
 
 class ResourceMetrics:
     """Resource collector metrics"""
-    # all names use llm_router_resource_<field>, matching the llm_router_<category>_<field> convention;
-    # P4 §3.3 samples (llm_router_memory_percent / llm_router_disk_percent) are rewritten in alert_rules.yml
-
     def __init__(self):
         self.cpu_percent = Gauge(
             "llm_router_resource_cpu_percent",

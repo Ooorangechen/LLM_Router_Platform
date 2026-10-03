@@ -218,7 +218,11 @@ monitoring:
     addr: 0.0.0.0
   metrics_expose:
     use_fastapi_mount: true # app.mount("/metrics")
+  
   prometheus:
+    server_url: http://localhost:9090
+    alert_rules_file: monitoring/alert_rules.yml
+    config_file: monitoring/prometheus.yml
     scrape_interval_seconds: 15
   
   grafana:

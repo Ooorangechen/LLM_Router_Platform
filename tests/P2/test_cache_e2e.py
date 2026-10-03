@@ -64,7 +64,7 @@ async def test_real_redis_cache_e2e():
         status(5, "Removed stale entries for this E2E test")
 
         status(6, "Reading an empty key; cache miss expected")
-        assert await cache.get_cached_response(key) is None
+        assert await cache.get_cached_response(key, model_name) is None
         status(7, "Initial cache miss passed")
 
         response = InferenceResponse(
@@ -86,7 +86,7 @@ async def test_real_redis_cache_e2e():
         status(9, f"Cache write passed; remaining TTL={ttl}s")
 
         status(10, "Reading the same key; cache hit expected")
-        cached = await cache.get_cached_response(key)
+        cached = await cache.get_cached_response(key, model_name)
         assert cached == response_data
         restored = InferenceResponse(**{**cached, "cached": True})
         assert restored.cached is True
@@ -95,7 +95,7 @@ async def test_real_redis_cache_e2e():
         status(11, "Cache hit, JSON round trip, and response restoration passed")
 
         status(12, "Reading the changed-context key; cache miss expected")
-        assert await cache.get_cached_response(changed_key) is None
+        assert await cache.get_cached_response(changed_key, model_name) is None
         status(13, "Changed-context cache miss passed")
 
         status(14, "Verifying error responses are not cached")

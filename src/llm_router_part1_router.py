@@ -676,9 +676,11 @@ class ModelRouter:
         # Observability failures must never discard a completed decision.
         try:
             ROUTER_METRICS.routing_decisions.labels(
-                model=decision.selected_model, query_type=decision.query_type.value
+                selected_model=decision.selected_model,
+                query_type=decision.query_type.value,
+                strategy=decision.routing_strategy,
             ).inc()
-            ROUTER_METRICS.routing_duration.observe(perf_counter() - start)
+            ROUTER_METRICS.routing_duration_seconds.observe(perf_counter() - start)
             ROUTER_METRICS.routing_confidence.labels(
                 model=decision.selected_model, query_type=decision.query_type.value
             ).observe(decision.confidence)

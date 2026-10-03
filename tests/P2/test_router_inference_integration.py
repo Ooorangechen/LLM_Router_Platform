@@ -187,9 +187,9 @@ async def test_real_redis_cache(app_config):
     value = {"response_text": "cached integration response", "error": None}
     try:
         await cache.redis_client.delete(key)
-        assert await cache.get_cached_response(key) is None
+        assert await cache.get_cached_response(key, "gpt-5.6-terra") is None
         await cache.cache_response(key, value)
-        assert await cache.get_cached_response(key) == value
+        assert await cache.get_cached_response(key, "gpt-5.6-terra") == value
         print(f"Redis: miss -> write -> hit, key={key}, ttl={await cache.redis_client.ttl(key)}s")
     finally:
         await cache.redis_client.delete(key)

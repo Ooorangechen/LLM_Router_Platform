@@ -1,40 +1,417 @@
 {
-  "title": "LLM Router Platform - Overview",
-  "timezone": "browser",
-  "refresh": "10s",
+  "id": null,
+  "uid": "llm-router-main",
+  "title": "LLM Router Platform — Main Overview",
+  "description": "P4 main overview: RPS / P95 latency / success rate / cost stats, model distribution, per-model P95 trend, recent error queries (ClickHouse).",
+  "tags": ["llm-router", "platform", "mvp"],
+  "timezone": "utc",
+  "schemaVersion": 38,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
   "time": {
-    "from": "now-1h",
+    "from": "now-6h",
     "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["10s", "30s", "1m", "5m", "15m", "1h"]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {"text": "Prometheus", "value": "Prometheus"},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "definition": "label_values(llm_router_inference_requests_total, model_name)",
+        "query": {
+          "query": "label_values(llm_router_inference_requests_total, model_name)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {"text": ["All"], "value": ["$__all"]},
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "user_tier",
+        "label": "User Tier",
+        "description": "Queried from the user_tier label on llm_router_inference_requests_total (P4 adjustment). Filters the per-tier latency panel and the ClickHouse error table.",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "definition": "label_values(llm_router_inference_requests_total, user_tier)",
+        "query": {
+          "query": "label_values(llm_router_inference_requests_total, user_tier)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {"text": ["All"], "value": ["$__all"]},
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "env",
+        "label": "Env",
+        "description": "Informational only: prometheus.yml external_labels are not attached to locally stored series, so no query filters on env.",
+        "type": "custom",
+        "query": "dev,stg,prod",
+        "includeAll": false,
+        "multi": false,
+        "current": {"text": "dev", "value": "dev"},
+        "hide": 0,
+        "options": [
+          {"text": "dev", "value": "dev", "selected": true},
+          {"text": "stg", "value": "stg", "selected": false},
+          {"text": "prod", "value": "prod", "selected": false}
+        ]
+      },
+      {
+        "name": "ch_datasource",
+        "label": "ClickHouse",
+        "type": "datasource",
+        "query": "grafana-clickhouse-datasource",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      }
+    ]
   },
   "panels": [
     {
-      "id": 1,
-      "title": "Requests Per Second",
-      "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-      "targets": [
-        {"expr": "sum(rate(llm_router_requests_total[1m]))", "legendFormat": "rps"}
-      ]
-    },
-    {
       "id": 2,
-      "title": "P95 Latency",
-      "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "title": "Requests Per Second (RPS)",
+      "type": "stat",
+      "gridPos": {"x": 0, "y": 1, "w": 6, "h": 3},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(llm_router_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "p95"
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(rate(llm_router_inference_requests_total{model_name=~\"$model\"}[1m]))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "rps"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2,
+          "color": {"mode": "fixed", "fixedColor": "green"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
     },
     {
       "id": 3,
-      "title": "Model Distribution",
-      "type": "piechart",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "title": "P95 Response Latency (ms)",
+      "type": "stat",
+      "gridPos": {"x": 6, "y": 1, "w": 6, "h": 3},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
       "targets": [
-        {"expr": "sum by (model) (llm_router_router_routing_decisions_total)", "legendFormat": "{{model}}"}
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "1000 * histogram_quantile(0.95, sum by (le) (rate(llm_router_inference_request_duration_seconds_bucket{model_name=~\"$model\"}[5m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 2000},
+              {"color": "red", "value": 5000}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Success Rate (%)",
+      "type": "stat",
+      "gridPos": {"x": 12, "y": 1, "w": 6, "h": 3},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "100 * sum(rate(llm_router_inference_requests_total{status=\"success\", model_name=~\"$model\"}[5m])) / sum(rate(llm_router_inference_requests_total{model_name=~\"$model\"}[5m]))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "success %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 95},
+              {"color": "green", "value": 99}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Cumulative Cost (Window)",
+      "description": "increase() over the selected time range ($__range, default 6h).",
+      "type": "stat",
+      "gridPos": {"x": 18, "y": 1, "w": 6, "h": 3},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(increase(llm_router_inference_cost_usd_total{model_name=~\"$model\"}[$__range]))",
+          "instant": true,
+          "range": false,
+          "legendFormat": "cost"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "color": {"mode": "fixed", "fixedColor": "blue"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "blue", "value": null}]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "title": "Model Distribution (by Requests)",
+      "type": "piechart",
+      "gridPos": {"x": 0, "y": 4, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum by (model_name) (increase(llm_router_inference_requests_total{model_name=~\"$model\"}[$__range]))",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{model_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "donut",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "displayLabels": ["percent"],
+        "legend": {
+          "show": true,
+          "displayMode": "table",
+          "placement": "right",
+          "values": ["value", "percent"]
+        },
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 7,
+      "title": "P95 Latency Trend by Model x User Tier (ms)",
+      "description": "One curve per model_name x user_tier, from the user_tier label added in the P4 adjustment (docs/p4_adjustment.md). Filtered by the $model and $user_tier variables.",
+      "type": "timeseries",
+      "gridPos": {"x": 8, "y": 4, "w": 16, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, model_name, user_tier) (rate(llm_router_inference_request_duration_seconds_bucket{model_name=~\"$model\", user_tier=~\"$user_tier\"}[$__rate_interval])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{model_name}} / {{user_tier}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {"mode": "dashed"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "transparent", "value": null},
+              {"color": "yellow", "value": 2000},
+              {"color": "red", "value": 5000}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["mean", "max", "lastNotNull"]
+        },
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 9,
+      "title": "ClickHouse Details",
+      "type": "row",
+      "collapsed": true,
+      "gridPos": {"x": 0, "y": 12, "w": 24, "h": 1},
+      "panels": [
+        {
+          "id": 8,
+          "title": "Top 10 Recent Error Queries",
+          "description": "Requires the grafana-clickhouse-datasource plugin and a ClickHouse datasource selected in the ClickHouse variable.",
+          "type": "table",
+          "gridPos": {"x": 0, "y": 13, "w": 24, "h": 8},
+          "datasource": {"type": "grafana-clickhouse-datasource", "uid": "$ch_datasource"},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "grafana-clickhouse-datasource", "uid": "$ch_datasource"},
+              "editorType": "sql",
+              "queryType": "table",
+              "format": 1,
+              "rawSql": "SELECT request_received_at, query_id, user_id, user_tier, selected_model AS model_name, latency_ms, error FROM query_logs WHERE status = 'error' AND $__timeFilter(request_received_at) AND user_tier IN (${user_tier:singlequote}) ORDER BY request_received_at DESC LIMIT 10"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "cellOptions": {"type": "auto"}
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "error"},
+                "properties": [
+                  {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}},
+                  {"id": "custom.cellOptions", "value": {"type": "color-text"}}
+                ]
+              },
+              {
+                "matcher": {"id": "byName", "options": "latency_ms"},
+                "properties": [
+                  {"id": "unit", "value": "ms"},
+                  {"id": "color", "value": {"mode": "thresholds"}},
+                  {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "yellow", "value": 2000},
+                    {"color": "red", "value": 5000}
+                  ]}},
+                  {"id": "custom.cellOptions", "value": {"type": "color-text"}}
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm",
+            "footer": {"show": false, "reducer": ["sum"], "fields": ""}
+          }
+        }
       ]
     }
   ]

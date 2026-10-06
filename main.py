@@ -134,6 +134,14 @@ class LLMRouterPlatform:
             kwargs["json_format"] = log_cfg["json_format"]
         setup_logging(**kwargs)
 
+    def _should_start_prom_server(self, monitoring_cfg, prom_server_cfg) -> bool:
+        '''helper function to simply the prom server start'''
+        return (
+        _PROM_AVAILABLE
+        and monitoring_cfg.get("enabled", False)
+        and prom_server_cfg.get("enabled", False)
+        and self.prom_server is None)
+    
     async def _initialize_services(self):
         """Initialize router, optional P3 pipeline, then inference."""
         self.logger.info("Initializing LLM Router Platform services...")
@@ -164,12 +172,7 @@ class LLMRouterPlatform:
         # P4 Mode B: standalone Prometheus HTTP server
         monitoring_cfg = self.config.get("monitoring", {})
         prom_server_cfg = monitoring_cfg.get("prometheus_server", {})
-        if (
-            _PROM_AVAILABLE
-            and monitoring_cfg.get("enabled", False)
-            and prom_server_cfg.get("enabled", False)
-            and self._prom_server is None
-        ):
+        if self._should_start_prom_server(monitoring_cfg, prom_server_cfg):
             port = prom_server_cfg.get("port", 9101)
             addr = prom_server_cfg.get("addr", "0.0.0.0")
             try:

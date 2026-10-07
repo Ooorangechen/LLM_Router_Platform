@@ -203,18 +203,81 @@ class LLMRouterPlatform:
 
         self.logger.info("All services initialized successfully")
 
-    # def _build_health_status(self, services: Dict) -> Tuple[str, int, Dict]:
-    #     try:
-    #         service_status = {}
-    #         for name, service in self.services.items():
-    #             if hasattr(service, "is_healthy"):
-    #                 service_status[name] = service.is_healthy()
-    #             elif hasattr(service, "get_health_status"):
-    #                 service_status[name] = service.get_health_status()
-    #             else:
-    #                     service_status[name] = {"healthy": True}
-    #     except Exception as e:
-    #         self.logger.warning("")
+    def _build_health_status(self, services) -> Tuple[str, int, Dict]:
+        """Traverse services into {status, message, last_check_at} per service,
+        then aggregate into (overall_status, overall_score, services_dict).
+
+        Per-service handling (shapes differ, so dispatch by name):
+          - monitor / alert : return a HealthStatus (part4) -> use as-is;
+          - inference       : P2-frozen {"healthy": bool, "providers": {...}} -> map;
+          - pipeline        : no health method -> derive from enabled/kafka/ch;
+          - router          : no health method -> models count (initialize()
+                              guarantees >=1), richer than the bare default;
+          - others          : P4 default healthy(message="registered").
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        svc: Dict[str, Dict] = {}
+        for name, service in services.items():
+            try:
+                if name in ("monitor", "alert"):
+                    entry = service.get_health_status().model_dump(mode="json")
+                elif name == "inference":
+                    raw = service.get_health_status()
+                    ready = [p for p, s in raw.get("providers", {}).items()
+                             if s.get("status") == "healthy"]
+                    ok = raw.get("healthy", False)
+                    entry = {
+                        "status": "healthy" if ok else "unhealthy",
+                        "message": (f"{len(ready)} providers ready "
+                                    f"({', '.join(ready)})"
+                                    if ok else "no provider available"),
+                        "last_check_at": now,
+                    }
+                elif name == "pipeline":
+                    if not getattr(service, "enabled", False):
+                        status, message = "healthy", "disabled"
+                    else:
+                        kafka_ok = service.producer.enabled
+                        ch_ok = service.ch_writer.enabled
+                        if kafka_ok and ch_ok:
+                            status, message = "healthy", "kafka+clickhouse ok"
+                        else:
+                            status = "degraded"
+                            message = f"kafka={kafka_ok}, clickhouse={ch_ok}"
+                    entry = {"status": status, "message": message,
+                             "last_check_at": now}
+                elif name == "router":
+                    n = len(getattr(service, "models", {}) or {})
+                    entry = {"status": "healthy",
+                             "message": f"{n} models loaded",
+                             "last_check_at": now}
+                else:
+                    entry = {"status": "healthy", "message": "registered",
+                             "last_check_at": now}
+            except Exception as exc:
+                entry = {"status": "unhealthy",
+                         "message": f"health check error: {exc}",
+                         "last_check_at": now}
+            svc[name] = entry
+
+        statuses = [v["status"] for v in svc.values()]
+        if any(s == "unhealthy" for s in statuses):
+            overall, score = "unhealthy", 2
+        elif any(s == "degraded" for s in statuses):
+            overall, score = "degraded", 1
+        else:
+            overall, score = "healthy", 0        # empty services -> healthy
+
+        try:                                     # metric write must not break /health
+            src.utils.metrics.HEALTH_METRICS.overall_health_status.set(score)
+            for n, v in svc.items():
+                src.utils.metrics.HEALTH_METRICS.service_health_info.labels(
+                    service_name=n, status=v["status"], message=v["message"]
+                ).info({"last_check_at": v["last_check_at"]})
+        except Exception as exc:
+            self.logger.debug("health metric write failed: %s", exc)
+
+        return overall, score, svc
 
     def _record_traffic(self, is_error: bool) -> None:
         """record one /route outcome into 60s window"""
@@ -306,35 +369,19 @@ class LLMRouterPlatform:
 
         @app.get("/health")
         async def health():
-            try:
-                service_status = {}
-                for name, service in self.services.items():
-                    if hasattr(service, "is_healthy"):
-                        service_status[name] = service.is_healthy()
-                    elif hasattr(service, "get_health_status"):
-                        service_status[name] = service.get_health_status()
-                    else:
-                        service_status[name] = {"healthy": True}
-
-                # §3.6.2 requires all_ok = all services healthy
-                # （bool / dict）,  all(values()) will return True when empty dict 
-                # even {"healthy": False} will count as healthy.
-                def _is_ok(v):
-                    return v.get("healthy", False) if isinstance(v, dict) else bool(v)
-
-                all_ok = all(_is_ok(v) for v in service_status.values()) \
-                    if service_status else True
-                return {
-                    "status": "healthy" if all_ok else "degraded",
-                    "services": service_status,
-                    "timestamp": time.time(),
-                }
-            except Exception as exc:
-                return {
-                    "status": "degraded",
-                    "error": str(exc),
-                    "timestamp": time.time(),
-                }
+            from fastapi.responses import JSONResponse
+            overall, score, svc = self._build_health_status(self.services)
+            body = {
+                "status": overall,
+                "overall_score": score,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "uptime_seconds": time.time() - self._start_time,
+                "services": svc,
+            }
+            # healthy/degraded -> 200 (monitor scrapes treat 2xx as alive),
+            # unhealthy -> 503.
+            return JSONResponse(content=body,
+                                status_code=503 if score >= 2 else 200)
 
         @app.get("/status")
         async def status():

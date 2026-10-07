@@ -1,15 +1,17 @@
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 import time
 from typing import List, Dict, Any, Optional, Tuple, Deque
 import asyncio
 from collections import deque
 from src.utils.logger import get_logger
-from src.utils.metrics import INFERENCE_METRICS
+from src.utils.metrics import INFERENCE_METRICS, ALERT_METRICS
 import os
 import platform # consider both windows / linux, mac
 from abc import abstractmethod, ABC
+import math 
+import httpx
 
 try:
     import psutil
@@ -265,12 +267,21 @@ class AlertManager:
         self._error_samples: Deque[Tuple[float, float, float]] = deque()
 
         self.rules: List[AlertRule] = []
-        self._active: Dict[str, AlertRecord] = {}  # key = rule_name
+        self._active: Dict[str, AlertRecord] = {}  # key = rule.name
         self._history: Deque[AlertRecord] = deque(maxlen=self._history_max_size)
         self._notifiers: Dict[str, BaseNotifier] = {}
 
+        # record event per-rule streak hitting counter
+        self._hit_strek: Dict[str, int] = {}
+        self._miss_strek: Dict[str, int] = {}
+        
+        self._last_notify_at: Dict[str, float] = {}
+
         self._running: bool = False
         self._task = None
+
+        self._prometheus_url = monitor_config.get("prometheus", {}).get("server_url", "http://localhost:9090")
+
 
     async def initialize(self) -> None:
         if self._rules_override:
@@ -343,11 +354,9 @@ class AlertManager:
             ),
         ]
 
-
     async def start(self) -> None:
         self._running = True
         self._task = asyncio.create_task(self._eval_loop())
-
 
     async def _eval_loop(self) -> None:
         while self._running:
@@ -355,22 +364,23 @@ class AlertManager:
                 if not rule.enabled:
                     continue
                 try:
-                    triggered, value = self._evaluate_rule(rule)
+                    triggered, value = await self._evaluate_rule(rule)
                     result = self._record_event(rule, triggered, value, rule.extra_labels)
                     if result is not None:
                         record, action = result
-                        await self._notify_all(record, action)
+                        if self._should_notify(record, action):
+                            await self._notify_all(record, action)
                 except Exception as e:
                     self.logger.warning("Alert rule '%s' evaluation failed: %s", rule.name, e)
             await asyncio.sleep(self._interval_sec)
 
-    def _evaluate_rule(self, rule: AlertRule) -> Tuple[bool, float]:
+    async def _evaluate_rule(self, rule: AlertRule) -> Tuple[bool, float]:
         name = rule.name
         try:
             if name == "HighErrorRate":
                 value = self._approx_error_rate()
             elif name == "HighLatencyP95Sec":
-                value = self._p95_latency_seconds()
+                value = await self._p95_latency_seconds()
             elif name == "HighMemoryPercent":
                 value = self._snapshot_value("memory_percent")
             elif name == "HighDiskPercent":
@@ -385,34 +395,159 @@ class AlertManager:
             return (False, 0.0)
         return (value > rule.threshold, value)
 
+    def _inference_request_totals(self) -> Tuple[float, float]:
+        total = errors = 0.0
+        try:
+            for family in INFERENCE_METRICS.requests_total.collect():
+                for s in family.samples:
+                    if not s.name.endswith("_total"):   # skip _created
+                        continue
+                    total += s.value
+                    if s.labels.get("status") == "error":
+                        errors += s.value
+        except Exception as e:
+            self.logger.warning("read INFERENCE_METRICS failed: %s", e)
+        return (total, errors)
+    
+    def _approx_error_rate(self) -> Optional[float]:
+        total, errors = self._inference_request_totals()
+
+        now = time.time()
+        self._error_samples.append((now,total,errors))
+        cutoff = now - self._error_window_sec
+        while self._error_samples and self._error_samples[0][0] < cutoff:
+            self._error_samples.popleft()
+
+        _, base_total, base_errors = self._error_samples[0]
+        d_total = total - base_total
+        d_errors = errors - base_errors
+        if d_total <= 0:
+            return None
+        return d_errors / d_total
+
+    async def _p95_latency_seconds(self) -> Optional[float]:
+        query = ("histogram_quantile(0.95, sum by (le) (rate(llm_router_inference_request_duration_seconds_bucket[5m])))")
+        try:
+            async with  httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(f"{self._prometheus_url}/api/v1/query",
+                params={"query": query})
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+            if payload.get("status") != "success":
+                return None
+            result = payload["data"]["result"]
+            value = float(result[0]["value"][1])
+            if value != value:
+                return None
+            return value
+        except Exception as e:
+            self.logger.warning("Prometheus P95 query failed: %s", e)
+            return None 
+        
+    def _snapshot_value(self, field:str) -> Optional[float]:
+        collector = self.services_ref.get("monitor")
+        if collector is None:
+            return None
+        snap = collector.get_latest_snapshot()
+        if snap is None or snap.cpu_percent < 0 or snap.memory_percent < 0:
+            return None
+        val = getattr(snap, field, None)
+        return None if val is None else float(val)
 
     def _record_event(self, rule, firing: bool, value, labels):
-        # firing and hitting ondition continuously N time swith duration -> set to active, otherwise pending
-        # active and missing conditions continuously N times within duration -> set to resolved 
+        rule_name = rule.name
+        now = datetime.now(timezone.utc)
+        need = max(1, math.ceil(rule.duration_seconds / self._interval_sec)) # the needed counter
+        active = self._active.get(rule_name)
 
-        # record event into history using append, pop(0) if over 100, or use collections.deque(maxlen=1000)
+        if firing: 
+            self._hit_strek[rule_name] = self._hit_strek.get(rule_name, 0) + 1
+            self._miss_strek[rule_name] = 0 
 
-        ALERT_METRICS.alerts_total.labels(rule, severity, action=firing |resolved|duplicated).inc()
+            if active is not None: 
+                # already active, duplicate hit, no notifification
+                ALERT_METRICS.alerts_total.labels(rule_name=rule_name, severity=rule.severity, action="deduplicated").inc()
+                return None
+                
+            if self._hit_strek[rule_name] < need:
+                return None 
 
-    def _notify_all(self, record:AlertRecord, action:str):
-        for i in self._notifiers.value():
+            # when first firing
+            record = AlertRecord(
+                alert_id=uuid4(),rule_name=rule_name, severity=rule.severity,
+                status="firing", value=value, threshold= rule.threshold, 
+                fired_at=now, description=rule.description, labels=labels
+            )
+            self._active[rule_name] = record
+            self._history.append(record)
+            ALERT_METRICS.alerts_total.labels(rule_name=rule_name, severity=rule.severity, action="fired").inc()
+            ALERT_METRICS.active_alerts.labels(severity=rule.severity).inc()
+            return (record, "firing")
+
+        else:
+            self._miss_strek[rule_name] = self._miss_strek.get(rule_name, 0) + 1
+            self._hit_strek[rule_name] = 0
+
+            if active is None:
+                return None
+
+            if self._miss_strek[rule_name] < need:
+                return None 
+
+            # active and missing conditions continuously within duration, resolved
+            record = self._active.pop(rule_name)
+            record.status = "resolved"
+            record.resolved_at = now
+            self._history.append(record)
+            # recovered -> clear the suppression window so a new fire notifies at once
+            self._last_notify_at.pop(rule_name, None)
+            ALERT_METRICS.alerts_total.labels(
+                rule_name=rule_name, severity=rule.severity, action="resolved").inc()
+            ALERT_METRICS.active_alerts.labels(severity=record.severity).dec()
+            return (record, "resolved")
+
+    def _should_notify(self, record: AlertRecord, action: str) -> bool:
+        if action != "firing":
+            return True
+        now = time.monotonic()
+        last = self._last_notify_at.get(record.rule_name)
+        if last is not None and (now - last) < self._suppress_duplicate_seconds:
+            return False
+        self._last_notify_at[record.rule_name] = now
+        return True
+
+    async def _notify_all(self, record:AlertRecord, action:str):
+        for channel, notifier in self._notifiers.items():
             try:
-                await i.send_alert(record, action)
-                ALERT_METRICS.notifications_total.labels(channel=name, status="ok").inc()
+                ok = await notifier.send_alert(record, action)
+            except Exception as e:
+                ok = False
+                self.logger.warning("Notifier '%s' failed on alert '%s': %s", channel, record.rule_name, e)
+            status = 'success' if ok else 'failure'
+            try:
+                ALERT_METRICS.notifications_total.labels(channel=channel, status=status).inc()
             except Exception:
-                ALERT_METRICS.notifications_total.labels(channel=name, status="fail").inc()
+                pass
 
-    def get_active_alerts(self) -> List[AlertRecord]:
-        # status = firing, dict friendly
-
-        pass
+    def get_active_alerts(self, severity: Optional[str] = None) -> List[AlertRecord]:
+        records = list(self._active.values())
+        if severity:
+            records = [r for r in records if r.severity == severity]
+        return records 
 
     def get_history(self, limit=200) -> List[AlertRecord]:
-        # reverse order by fired_at
-        pass
-
-    async def stop():
-        pass
+        orderd = sorted(self._history, key = lambda r: r.fired_at, reverse=True)
+        return orderd[:limit]
+    
+    async def stop(self):
+        self._running = False
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
 
 
@@ -457,8 +592,7 @@ class SlackWebhookNotifier(BaseNotifier):
         self.logger = get_logger("slack_notifier")
         # config load notifiers.slack 
         env_name = config.get("webhook_url_env", "")
-        if not env_name:
-            url = os.environ.get(env_name, "") or ""
+        url = os.environ.get(env_name, "") if env_name else ""
         self.webhook_url = url
         self.channel = config.get("channel", "")
         self.mention = config.get("mention", "")

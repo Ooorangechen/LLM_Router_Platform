@@ -9,11 +9,11 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from copy import deepcopy
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Tuple
 import click
 import yaml
 from dotenv import load_dotenv
-
+from collections import deque
 from src.llm_router_part0_setup import setup_project_environment
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
@@ -52,15 +52,17 @@ class LLMRouterPlatform:
     """
     load config, initialize logging,  initializeing service structure
     """
-
     def __init__(self, config_path: Union[str, Path] = CONFIG_PATH):
         self.config_path = Path(config_path).resolve()
         load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
         self.config = self._load_config()
         self.services = {}
         self._prom_server = None
+        self._start_time = time.time()
+        self._traffic_window: deque = deque(maxlen=100_000)
         self._setup_logging()
         self.logger = get_logger(__name__)
+
 
     def _load_config(self) -> dict:
         """
@@ -184,6 +186,39 @@ class LLMRouterPlatform:
 
         self.logger.info("All services initialized successfully")
 
+    # def _build_health_status(self, services: Dict) -> Tuple[str, int, Dict]:
+    #     try:
+    #         service_status = {}
+    #         for name, service in self.services.items():
+    #             if hasattr(service, "is_healthy"):
+    #                 service_status[name] = service.is_healthy()
+    #             elif hasattr(service, "get_health_status"):
+    #                 service_status[name] = service.get_health_status()
+    #             else:
+    #                     service_status[name] = {"healthy": True}
+    #     except Exception as e:
+    #         self.logger.warning("")
+
+    def _record_traffic(self, is_error: bool) -> None:
+        """record one /route outcome into 60s window"""
+        now = time.time()
+        self._traffic_window.append((now, is_error))
+        cutoff = now - 60.0
+        w = self._traffic_window
+        while w and w[0][0] < cutoff:
+            w.popleft()
+
+    def _traffic_recent_1min(self) -> Dict[str, float]:
+        """aggregate 60s window: request count + error rate"""
+        cutoff = time.time() - 60.0
+        recent = [e for e in self._traffic_window if e[0] >= cutoff]
+        requests = len(recent)
+        errors = sum(1 for _, is_err in recent if is_err)
+        return {
+            "requests": requests,
+            "error_rate": (errors / requests) if requests else 0.0,
+        }
+
     async def _start_services(self):
         import uvicorn
         app = self._create_fastapi_app()
@@ -284,10 +319,79 @@ class LLMRouterPlatform:
 
         @app.get("/status")
         async def status():
+            monitoring_cfg = self.config.get("monitoring", {})
+            mon_enabled = monitoring_cfg.get("enabled", False)
+
+            router = self.services.get("router")
+            inference = self.services.get("inference")
+            pipeline = self.services.get("pipeline")
+            collector = self.services.get("monitor")
+            alert = self.services.get("alert")
+            use_integrated = self.config.get("router_mode", {}).get(
+                "use_integrated_router", False)
+            router_mode = "integrated" if use_integrated else "modular"
+            models_count = len(router.models) if router is not None else 0
+
+            providers_ready = []
+            if inference is not None:
+                try:
+                    health = inference.get_health_status()
+                    providers_ready = [
+                        name for name, s in health.get("providers", {}).items()
+                        if s.get("status") == "healthy"
+                    ]
+                except Exception as exc:
+                    self.logger.debug("providers_ready probe failed: %s", exc)
+
+            if pipeline is not None:
+                pipeline_block = {
+                    "enabled": pipeline.enabled,
+                    "kafka_ok": pipeline.producer.enabled,
+                    "clickhouse_ok": pipeline.ch_writer.enabled,
+                }
+            else:
+                pipeline_block = {
+                    "enabled": False, "kafka_ok": False, "clickhouse_ok": False}
+                
+            if mon_enabled:
+                monitoring_block = {
+                    "enabled": True,
+                    "resource_collector_running": bool(
+                        getattr(collector, "_running", False)),
+                    "alert_enabled": monitoring_cfg.get("alert_enabled", False),
+                    "active_alerts_count": (
+                        len(alert.get_active_alerts()) if alert is not None else 0),
+                }
+            else:
+                monitoring_block = {
+                    "enabled": False, "resource_collector_running": False,
+                    "alert_enabled": False, "active_alerts_count": 0}
+
+            if collector is not None:
+                s = collector.get_latest_snapshot()
+                resource_block = {
+                    "cpu_percent": s.cpu_percent,
+                    "memory_percent": s.memory_percent,
+                    "disk_percent": s.disk_percent,
+                    "gpu_count": s.gpu_count,
+                }
+            else:
+                resource_block = {
+                    "cpu_percent": -1, "memory_percent": -1,
+                    "disk_percent": 0, "gpu_count": 0}
+
             return {
-                "system": {},
-                "router_mode": self.config.get("router_mode", {}),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "uptime_seconds": time.time() - self._start_time,
+                "router_mode": router_mode,
+                "models_count": models_count,
+                "providers_ready": providers_ready,
+                "pipeline": pipeline_block,
+                "monitoring": monitoring_block,
+                "resource": resource_block,
+                "traffic_recent_1min": self._traffic_recent_1min(),
             }
+
 
         @app.get("/analytics")
         async def analytics():
@@ -312,6 +416,21 @@ class LLMRouterPlatform:
                 "services": list(self.services.keys()),
                 "count": len(self.services),
             }
+
+        @app.get('/admin/alerts/active')
+        async def admin_alerts_active(severity: Optional[str] = None):
+            alert_manager = self.services.get("alert", None)
+            if alert_manager is None or not alert_manager._running:
+                return []
+            return alert_manager.get_active_alerts(severity=severity)
+
+        @app.get('/admin/alerts/history')
+        async def admin_alerts_history(limit: Optional[int] = 100):
+            alert_manager = self.services.get("alert", None)
+            if alert_manager is None or not alert_manager._running:
+                return []
+            return alert_manager.get_history(limit)
+    
 
         @app.post("/route")
         async def route_query(request: Request):
@@ -356,6 +475,7 @@ class LLMRouterPlatform:
                     ).inc()
                 except Exception as metric_exc:
                     self.logger.debug("requests_total write failed: %s", metric_exc)
+                self._record_traffic(is_error=False)
                 return {
                     "query_id": str(query_request.request_id),
                     "response": resp.response_text,
@@ -376,6 +496,7 @@ class LLMRouterPlatform:
                     ).inc()
                 except Exception as metric_exc:
                     self.logger.debug("errors_total write failed: %s", metric_exc)
+                self._record_traffic(is_error=True)
                 raise HTTPException(status_code=500, detail=str(exc))
 
         return app

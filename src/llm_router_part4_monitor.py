@@ -217,11 +217,41 @@ class SystemResourceCollector:
             open_fds_count=0,
             uptime_seconds=0,
         )
+    
+    def get_health_status(self) -> HealthStatus:
+        """Operational health infomation"""
+        now = datetime.now(timezone.utc)
+        meta: Dict[str, Any] = {
+            "enabled": self.enabled,
+            "running": self._running,
+            "interval_sec": self.interval_sec
+        }
+
+        if psutil is None:
+            status, message = "degraded", "psutil unavailable, resource metrics off"
+        elif not self.enabled:
+            status, message = "healthy", "resource collector disabled by config"
+        elif not self._running:
+            status, message = "degraded", "collector not started"
+        else:
+            age = (now - self.snapshot.timestamp).total_seconds()
+            meta["snapshot_age_sec"] = round(age, 1)
+            meta["cpu_percent"] = self.snapshot.cpu_percent
+            meta["memory_percent"] = self.snapshot.memory_percent
+            if age > 3 * self.interval_sec:
+                status = "degraded"
+                message = f"collector stalled, last sample {age:.0f}s ago"
+            else:
+                status = "healthy"
+                message = (f"running (cpu={self.snapshot.cpu_percent:.1f}%, "
+                       f"mem={self.snapshot.memory_percent:.1f}%)")
+        return HealthStatus(service_name="monitor", status=status, message=message, last_check_at=now,metadata=meta)
 
     async def stop(self) -> None:
         self._running = False
         if self._task is not None:
             await self._task
+
 
 ## Alert Manager
 
@@ -539,7 +569,30 @@ class AlertManager:
     def get_history(self, limit=200) -> List[AlertRecord]:
         orderd = sorted(self._history, key = lambda r: r.fired_at, reverse=True)
         return orderd[:limit]
+
+    def get_health_status(self) -> HealthStatus:
+        from collections import Counter
+        now = datetime.now(timezone.utc)
+        active_by_sev = dict(Counter(r.severity for r in self._active.values()))
+        meta: Dict[str, Any] = {
+            "enabled": self.enabled,
+            "running": self._running,
+            "rules_count": len(self.rules),
+            "active_count": len(self._active),
+            "active_by_severity": active_by_sev,
+        }
+
+        if not self.enabled:                                  
+            status, message = "healthy", "alerting disabled by config"
+        elif not self._running:
+            status, message = "degraded", "enabled but eval loop not running"
+        else:
+            status = "healthy"
+            message = f"{len(self.rules)} rules loaded, {len(self._active)} active"
     
+        return HealthStatus(service_name="alert", status=status, message=message, last_check_at=now,metadata=meta)
+
+        
     async def stop(self):
         self._running = False
         if self._task is not None:
@@ -548,6 +601,7 @@ class AlertManager:
                 await self._task
             except asyncio.CancelledError:
                 pass
+
 
 
 

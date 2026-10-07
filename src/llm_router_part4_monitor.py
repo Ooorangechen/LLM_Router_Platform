@@ -233,6 +233,8 @@ class SystemResourceCollector:
             status, message = "healthy", "resource collector disabled by config"
         elif not self._running:
             status, message = "degraded", "collector not started"
+        elif self.snapshot is None:
+            status, message = "degraded", "awaiting first sample"
         else:
             age = (now - self.snapshot.timestamp).total_seconds()
             meta["snapshot_age_sec"] = round(age, 1)

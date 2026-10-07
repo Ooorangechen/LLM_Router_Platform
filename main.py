@@ -63,7 +63,6 @@ class LLMRouterPlatform:
         self._setup_logging()
         self.logger = get_logger(__name__)
 
-
     def _load_config(self) -> dict:
         """
         Load the platform config, then recursively apply an optional override.
@@ -171,6 +170,24 @@ class LLMRouterPlatform:
         await inference.initialize()
         self.services["inference"] = inference
 
+        # P4: resource collector + alert manager, only when monitoring is on.
+        monitoring_cfg = self.config.get("monitoring", {})
+        if monitoring_cfg.get("enabled", False):
+            from src.llm_router_part4_monitor import (
+                SystemResourceCollector, AlertManager)
+
+            collector = SystemResourceCollector(self.config)
+            await collector.initialize()
+            if collector.enabled:            
+                await collector.start()
+
+            self.services["monitor"] = collector
+            alert = AlertManager(self.config, self.services)
+            await alert.initialize()
+            if alert.enabled:                
+                await alert.start()
+            self.services["alert"] = alert
+
         # P4 Mode B: standalone Prometheus HTTP server
         monitoring_cfg = self.config.get("monitoring", {})
         prom_server_cfg = monitoring_cfg.get("prometheus_server", {})
@@ -243,6 +260,8 @@ class LLMRouterPlatform:
                 await service.stop_consumer()
                 await service.flush_all()
                 await service.shutdown()
+            elif name in ("monitor", "alert"):
+                await service.stop()
             elif hasattr(service, "shutdown"):
                 await service.shutdown()
         self.services.clear()
@@ -394,8 +413,84 @@ class LLMRouterPlatform:
 
 
         @app.get("/analytics")
-        async def analytics():
-            return {"system": {}}
+        async def analytics(window_minutes: int = 5, group_by: str = "model"):
+            window_minutes = max(1, min(int(window_minutes), 1440))
+
+            pipeline = self.services.get("pipeline")
+            ch_writer = getattr(pipeline, "ch_writer", None) if pipeline else None
+            ch_available = (
+                ch_writer is not None
+                and getattr(ch_writer, "enabled", False)
+                and getattr(ch_writer, "client", None) is not None
+            )
+
+            if ch_available:
+                sql = f"""
+                    SELECT
+                        selected_model                          AS model_name,
+                        count()                                 AS request_count,
+                        countIf(status='success') * 1.0 / count() AS success_rate,
+                        quantileExact(0.95)(latency_ms)         AS p95_latency_ms,
+                        avg(cost_usd)                           AS avg_cost_usd
+                    FROM query_logs
+                    WHERE request_received_at >= now() - INTERVAL {window_minutes} MINUTE
+                    GROUP BY selected_model
+                    ORDER BY request_count DESC
+                """
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(ch_writer.client.query, sql),
+                        timeout=2.0,
+                    )
+                    rows = [
+                        {
+                            "model_name": model_name,
+                            "request_count": int(request_count),
+                            "success_rate": float(success_rate),
+                            "p95_latency_ms": float(p95),
+                            "avg_cost_usd": float(avg_cost),  # Decimal/Float -> float
+                        }
+                        for (model_name, request_count, success_rate, p95, avg_cost)
+                        in result.result_rows
+                    ]
+                    return {
+                        "window_minutes": window_minutes,
+                        "data_source": "clickhouse",
+                        "rows": rows,
+                    }
+                except Exception as exc:
+                    self.logger.warning(
+                        "Analytics ClickHouse query failed, falling back to "
+                        "memory: %s", exc)
+
+            # fallback（router.model_stats）only have request_count / success_rate 
+            # p95、per-model cost is placeholder for now
+            router = self.services.get("router")
+            if router is not None:
+                rows = [
+                    {
+                        "model_name": name,
+                        "request_count": stats.get("total_requests", 0),
+                        "success_rate": stats.get("success_rate", 0.0),
+                        "p95_latency_ms": 0.0,   # placeholder: no latency samples in memory
+                        "avg_cost_usd": 0.0,     # placeholder: per-model cost not tracked
+                    }
+                    for name, stats in router.model_stats.items()
+                    if stats.get("total_requests", 0) > 0
+                ]
+                if rows:
+                    return {
+                        "window_minutes": window_minutes,
+                        "data_source": "memory",
+                        "rows": rows,
+                    }
+                
+            return {
+                "window_minutes": window_minutes,
+                "data_source": "none",
+                "rows": [],
+                "error": "no analytics backend available",
+            }
 
         @app.post("/admin/reload-config")
         async def reload_config():

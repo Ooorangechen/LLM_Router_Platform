@@ -1,11 +1,15 @@
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
+from uuid import UUID
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Deque
 import asyncio
+from collections import deque
 from src.utils.logger import get_logger
+from src.utils.metrics import INFERENCE_METRICS
 import os
 import platform # consider both windows / linux, mac
+from abc import abstractmethod, ABC
 
 try:
     import psutil
@@ -216,3 +220,288 @@ class SystemResourceCollector:
         self._running = False
         if self._task is not None:
             await self._task
+
+## Alert Manager
+
+class AlertRule(BaseModel):
+    name: str
+    expr_lambda_src: str
+    threshold: float
+    duration_seconds: int
+    severity: str
+    description: str
+    enabled: bool
+    extra_labels: Dict[str, str] = {}
+
+class AlertRecord(BaseModel):
+    alert_id: UUID
+    rule_name: str
+    severity: str
+    status: str
+    value: float
+    threshold: float
+    fired_at: datetime
+    resolved_at: Optional[datetime] = None  
+    description: str
+    labels: Dict[str, str] = {}            
+
+class AlertManager:
+    def __init__(self, config: Dict, services_ref: Dict[str, Any]) -> None:
+        self.logger = get_logger("alert")
+        self.services_ref = services_ref
+
+        monitor_config = config.get("monitoring", {})
+        alert_manager_config = monitor_config.get("alert_manager", {})
+        self.enabled: bool = monitor_config.get("alert_enabled", False)
+
+        self._interval_sec: int = alert_manager_config.get("eval_interval_sec", 15)
+        self._suppress_duplicate_seconds: int = alert_manager_config.get("suppress_duplicate_seconds", 300)
+        self._history_max_size: int = alert_manager_config.get("history_max_size", 1000)
+        self._rules_override: List[Any] = alert_manager_config.get("rules_override", []) or []
+        self._notifier_config: Dict[str, Any] = alert_manager_config.get("notifiers", {})
+
+        # error rate 5 min window: ts, total_cumulative, errors_cumulative
+        self._error_window_sec: int = alert_manager_config.get("error_rate_window_sec", 300)
+        self._error_samples: Deque[Tuple[float, float, float]] = deque()
+
+        self.rules: List[AlertRule] = []
+        self._active: Dict[str, AlertRecord] = {}  # key = rule_name
+        self._history: Deque[AlertRecord] = deque(maxlen=self._history_max_size)
+        self._notifiers: Dict[str, BaseNotifier] = {}
+
+        self._running: bool = False
+        self._task = None
+
+    async def initialize(self) -> None:
+        if self._rules_override:
+            self.rules = [
+                r if isinstance(r, AlertRule) else AlertRule(**r)
+                for r in self._rules_override
+            ]
+        else:
+            self.rules = self._load_default_rules()
+
+        cfg = self._notifier_config or {}
+
+        if cfg.get("stdout", {}).get("enabled", True):
+            self._notifiers["stdout"] = StdoutNotifier()
+
+        slack = SlackWebhookNotifier(cfg.get("slack", {}))
+        if slack.enabled:
+            self._notifiers["slack"] = slack
+
+        email = EmailNotifier(cfg.get("email", {}))
+        if email.enabled:
+            self._notifiers["email"] = email
+
+        pagerduty = PagerDutyNotifier(cfg.get("pagerduty", {}))
+        if pagerduty.enabled:
+            self._notifiers["pagerduty"] = pagerduty
+
+        self.logger.info(
+            "AlertManager initialized (%d rules, notifiers=%s, alert_enabled=%s)",
+            len(self.rules), list(self._notifiers.keys()), self.enabled,
+        )
+
+    def _load_default_rules(self) -> List[AlertRule]:
+        return [
+            AlertRule(
+                name="HighErrorRate",
+                expr_lambda_src="inference error_rate(5m) > 0.05",
+                threshold=0.05,
+                duration_seconds=120,
+                severity="critical",
+                description="Inference error rate over last 5m exceeds 5%",
+                enabled=True,
+            ),
+            AlertRule(
+                name="HighLatencyP95Sec",
+                expr_lambda_src="inference p95 latency > 5s",
+                threshold=5.0,
+                duration_seconds=300,
+                severity="warning",
+                description="Inference P95 latency exceeds 5 seconds",
+                enabled=True,
+            ),
+            AlertRule(
+                name="HighMemoryPercent",
+                expr_lambda_src="snapshot.memory_percent > 90",
+                threshold=90.0,
+                duration_seconds=120,
+                severity="warning",
+                description="System memory usage exceeds 90%",
+                enabled=True,
+            ),
+            AlertRule(
+                name="HighDiskPercent",
+                expr_lambda_src="snapshot.disk_percent > 80",
+                threshold=80.0,
+                duration_seconds=300,
+                severity="warning",
+                description="System disk usage exceeds 80%",
+                enabled=True,
+            ),
+        ]
+
+
+    async def start(self) -> None:
+        self._running = True
+        self._task = asyncio.create_task(self._eval_loop())
+
+
+    async def _eval_loop(self) -> None:
+        while self._running:
+            for rule in self.rules:
+                if not rule.enabled:
+                    continue
+                try:
+                    triggered, value = self._evaluate_rule(rule)
+                    result = self._record_event(rule, triggered, value, rule.extra_labels)
+                    if result is not None:
+                        record, action = result
+                        await self._notify_all(record, action)
+                except Exception as e:
+                    self.logger.warning("Alert rule '%s' evaluation failed: %s", rule.name, e)
+            await asyncio.sleep(self._interval_sec)
+
+    def _evaluate_rule(self, rule: AlertRule) -> Tuple[bool, float]:
+        name = rule.name
+        try:
+            if name == "HighErrorRate":
+                value = self._approx_error_rate()
+            elif name == "HighLatencyP95Sec":
+                value = self._p95_latency_seconds()
+            elif name == "HighMemoryPercent":
+                value = self._snapshot_value("memory_percent")
+            elif name == "HighDiskPercent":
+                value = self._snapshot_value("disk_percent")
+            else:
+                return (False, 0.0)
+        except Exception as e:
+            self.logger.warning("Rule '%s' value extraction failed: %s", name, e)
+            return (False, 0.0)
+
+        if value is None:
+            return (False, 0.0)
+        return (value > rule.threshold, value)
+
+
+    def _record_event(self, rule, firing: bool, value, labels):
+        # firing and hitting ondition continuously N time swith duration -> set to active, otherwise pending
+        # active and missing conditions continuously N times within duration -> set to resolved 
+
+        # record event into history using append, pop(0) if over 100, or use collections.deque(maxlen=1000)
+
+        ALERT_METRICS.alerts_total.labels(rule, severity, action=firing |resolved|duplicated).inc()
+
+    def _notify_all(self, record:AlertRecord, action:str):
+        for i in self._notifiers.value():
+            try:
+                await i.send_alert(record, action)
+                ALERT_METRICS.notifications_total.labels(channel=name, status="ok").inc()
+            except Exception:
+                ALERT_METRICS.notifications_total.labels(channel=name, status="fail").inc()
+
+    def get_active_alerts(self) -> List[AlertRecord]:
+        # status = firing, dict friendly
+
+        pass
+
+    def get_history(self, limit=200) -> List[AlertRecord]:
+        # reverse order by fired_at
+        pass
+
+    async def stop():
+        pass
+
+
+
+class BaseNotifier(ABC):
+
+    @abstractmethod
+    async def send_alert(self, record: AlertRecord, action: str) -> bool:
+        '''Send one alert. action is "firing" / "resolved" / "deduplicated".
+        Returns True on success, False on failure.'''
+        ...
+
+
+class StdoutNotifier(BaseNotifier):
+    '''Always enabled by default; prints each alert to logger.info.'''
+    def __init__(self):
+        super().__init__()
+        self.enabled = True
+        self.logger = get_logger("stdout_notifier")
+
+    async def send_alert(self, record: AlertRecord, action: str) -> bool:
+        try:
+            self.logger.info(
+                "[ALERT %s] %s severity=%s value=%s threshold=%s :: %s",
+                action.upper(),
+                record.rule_name,
+                record.severity,
+                record.value,
+                record.threshold,
+                record.description,
+            )
+            return True
+        except Exception as e:
+            self.logger.warning("StdoutNotifier failed: %s", e)
+            return False
+
+
+class SlackWebhookNotifier(BaseNotifier):
+    '''Posts alerts to a Slack Incoming Webhook.'''
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.logger = get_logger("slack_notifier")
+        # config load notifiers.slack 
+        env_name = config.get("webhook_url_env", "")
+        if not env_name:
+            url = os.environ.get(env_name, "") or ""
+        self.webhook_url = url
+        self.channel = config.get("channel", "")
+        self.mention = config.get("mention", "")
+        self.enabled = bool(config.get("enabled", False)) and bool(self.webhook_url)
+
+    async def send_alert(self, record: AlertRecord, action: str) -> bool:
+        if not self.enabled or not self.webhook_url:
+            return True
+        emoji = ":red_circle:" if action.lower() == "firing" else ":large_green_circle:"
+        text = (
+            f"{emoji} [{action.upper()}] {record.rule_name} "
+            f"(severity={record.severity}) value={record.value} "
+            f"threshold={record.threshold} :: {record.description}"
+        )
+        if self.mention:
+            text = f"{self.mention} {text}"
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.post(self.webhook_url, json={"text": text})
+            if resp.status_code >= 400:
+                self.logger.warning("Slack webhook returned HTTP %s", resp.status_code)
+                return False
+            return True
+        except Exception as e:
+            self.logger.warning("Slack webhook failed: %s", e)
+            return False
+
+class EmailNotifier(BaseNotifier):
+    def __init__(self, config: Dict[str, Any] = None):
+        super().__init__()
+        config = config or {}
+        self.enabled = bool(config.get("enabled", False))
+
+    async def send_alert(self, record: AlertRecord, action: str) -> bool:
+        return True
+
+class PagerDutyNotifier(BaseNotifier):
+    def __init__(self, config: Dict[str, Any] = None):
+        super().__init__()
+        config = config or {}
+        self.enabled = bool(config.get("enabled", False))
+
+    async def send_alert(self, record: AlertRecord, action: str) -> bool:
+        return True
+

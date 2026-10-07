@@ -240,6 +240,21 @@ monitoring:
     interval_seconds: 30
     timeout_seconds: 5
   
+  alert_manager:
+    eval_interval_sec: 15
+    rules_override: []               
+    suppress_duplicate_seconds: 300  
+    history_max_size: 1000
+    notifiers:
+      stdout: { enabled: true }
+      slack:
+        enabled: false
+        webhook_url_env: SLACK_ALERT_WEBHOOK_URL
+        channel: "#alerts"
+        mention: "@oncall"
+      email: { enabled: false, smtp_host: "", smtp_port: 587, username_env: "", password_env: "", from_addr: "", to_addrs: [] }
+      pagerduty: { enabled: false, routing_key_env: PAGERDUTY_ROUTING_KEY }
+
 slack:
   enabled: false
   bot_token_env: SLACK_BOT_TOKEN

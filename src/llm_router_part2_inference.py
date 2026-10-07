@@ -592,10 +592,12 @@ class InferenceEngine:
             self.router.update_model_stats(model_name, success=not response.error, latency_ms=response.latency_ms)
             if error_type:
                 INFERENCE_METRICS.errors_total.labels(model_name=model_name, error_type=error_type).inc()
-            # P4 adjustment: tag inference metrics with user_tier for per-tier SLO monitoring
+            INFERENCE_METRICS.requests_total.labels(model_name=model_name,provider=response.provider,status="error" if response.error else "success",).inc()
+            INFERENCE_METRICS.request_duration_seconds.labels(model_name=model_name, provider=response.provider).observe(perf_counter() - start)
+            # P4: add two parallel metrics to collect tier information, not affecting previoust stages 
             user_tier = request.user_tier.value
-            INFERENCE_METRICS.requests_total.labels(model_name=model_name, provider=response.provider, status="error" if response.error else "success", user_tier=user_tier).inc()
-            INFERENCE_METRICS.request_duration_seconds.labels(model_name=model_name, provider=response.provider, user_tier=user_tier).observe(perf_counter() - start)
+            INFERENCE_METRICS.requests_by_tier_total.labels(model_name=model_name, provider=response.provider, status="error" if response.error else "success", user_tier=user_tier).inc()
+            INFERENCE_METRICS.request_duration_by_tier_seconds.labels(model_name=model_name, provider=response.provider, user_tier=user_tier).observe(perf_counter() - start)
         except Exception as exc:
             logger.warning("Inference statistics update failed: %s", exc)
         return response

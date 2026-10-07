@@ -57,12 +57,12 @@
       {
         "name": "user_tier",
         "label": "User Tier",
-        "description": "Queried from the user_tier label on llm_router_inference_requests_total (P4 adjustment). Filters the per-tier latency panel and the ClickHouse error table.",
+        "description": "Queried from the user_tier label on llm_router_inference_requests_by_tier_total (P4 adjustment, parallel tier metric). Filters the per-tier latency panel and the ClickHouse error table.",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "$datasource"},
-        "definition": "label_values(llm_router_inference_requests_total, user_tier)",
+        "definition": "label_values(llm_router_inference_requests_by_tier_total, user_tier)",
         "query": {
-          "query": "label_values(llm_router_inference_requests_total, user_tier)",
+          "query": "label_values(llm_router_inference_requests_by_tier_total, user_tier)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "includeAll": true,
@@ -304,7 +304,7 @@
     {
       "id": 7,
       "title": "P95 Latency Trend by Model x User Tier (ms)",
-      "description": "One curve per model_name x user_tier, from the user_tier label added in the P4 adjustment (docs/p4_adjustment.md). Filtered by the $model and $user_tier variables.",
+      "description": "One curve per model_name x user_tier, from the parallel tier metric added in the P4 adjustment (docs/p4_adjustment.md). Filtered by the $model and $user_tier variables.",
       "type": "timeseries",
       "gridPos": {"x": 8, "y": 4, "w": 16, "h": 8},
       "datasource": {"type": "prometheus", "uid": "$datasource"},
@@ -312,7 +312,7 @@
         {
           "refId": "A",
           "datasource": {"type": "prometheus", "uid": "$datasource"},
-          "expr": "1000 * histogram_quantile(0.95, sum by (le, model_name, user_tier) (rate(llm_router_inference_request_duration_seconds_bucket{model_name=~\"$model\", user_tier=~\"$user_tier\"}[$__rate_interval])))",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, model_name, user_tier) (rate(llm_router_inference_request_duration_by_tier_seconds_bucket{model_name=~\"$model\", user_tier=~\"$user_tier\"}[$__rate_interval])))",
           "instant": false,
           "range": true,
           "legendFormat": "{{model_name}} / {{user_tier}}"

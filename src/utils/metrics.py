@@ -128,17 +128,26 @@ class InferenceMetrics:
     """
 
     def __init__(self):
-        # P4 adjustment: user_tier label added for per-tier SLO monitoring (Panel 7 latency by model x user_tier)
         self.requests_total = Counter("llm_router_inference_requests_total",
                                       "total number of inference requests",
-                                      labelnames=["model_name", "provider", "status", "user_tier"])
-
+                                      labelnames=["model_name", "provider", "status"])
+        
         self.request_duration_seconds = Histogram("llm_router_inference_request_duration_seconds",
                                            "inference requests duration",
+                                           labelnames=["model_name","provider"],
+                                           buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, float("inf")]
+                                           )
+        # P4: add two for Grafana Panel 7 - model×user_tier 
+        self.requests_by_tier_total = Counter("llm_router_inference_requests_by_tier_total",
+                                              "inference requests broken down by user tier",
+                                              labelnames=["model_name", "provider", "status", "user_tier"])
+
+        self.request_duration_by_tier_seconds = Histogram("llm_router_inference_request_duration_by_tier_seconds",
+                                           "inference request duration broken down by user tier",
                                            labelnames=["model_name", "provider", "user_tier"],
                                            buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, float("inf")]
                                            )
-        
+
         self.tokens_input_total =  Counter("llm_router_inference_tokens_input_total",
                                   "total number of input tokens used in inference",
                                   labelnames=["model_name"])

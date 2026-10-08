@@ -672,23 +672,71 @@ def start(config_path, dev):
         click.echo("Shutting down gracefully...")
 
 
-@cli.command()
-@click.option("--service", default=None, help="Checking the health status of one service")
-def health(service):
+_STATUS_COLORS = {"healthy": "\033[32m", "degraded": "\033[33m", "unhealthy": "\033[31m"}
+_COLOR_RESET = "\033[0m"
+_EXIT_BY_SCORE = {0: 0, 1: 2, 2: 3}   # healthy=0, degraded=2, unhealthy=3
+
+
+def _format_uptime(seconds) -> str:
+    s = int(seconds or 0)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {sec}s"
+    if m:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
+def _render_health_text(payload, use_color) -> str:
+    status = payload.get("status", "unknown")
+    score = payload.get("overall_score", 2)
+    lines = [
+        "LLM Router Platform Health",
+        "==========================",
+        f"Overall  : {status.upper():<11} (exit {_EXIT_BY_SCORE.get(score, 3)})",
+        f"Uptime   : {_format_uptime(payload.get('uptime_seconds'))}",
+        f"Checked  : {payload.get('checked_at', '')}",
+        "-------- Services -------",
+    ]
+    for name, obj in payload.get("services", {}).items():
+        st = obj.get("status", "unknown")
+        tag = f"[{st.upper()}]".ljust(11)          # pad before coloring to keep alignment
+        if use_color and st in _STATUS_COLORS:
+            tag = f"{_STATUS_COLORS[st]}{tag}{_COLOR_RESET}"
+        lines.append(f"{name:<12} {tag} {obj.get('message', '')}")
+    return "\n".join(lines)
+
+
+@cli.command(name="health")
+@click.option("--host", default="localhost", show_default=True)
+@click.option("--port", default=8080, show_default=True, type=int)
+@click.option("--timeout", default=10.0, show_default=True, type=float)
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]),
+              default="text", show_default=True)
+@click.option("--service", default=None, help="Show only one service")
+def health(host, port, timeout, fmt, service):
+    """exit 0=healthy / 2=degraded / 3=unhealthy."""
     import httpx
     try:
-        resp = httpx.get("http://localhost:8080/health", timeout=5.0)
-        resp.raise_for_status()
+        resp = httpx.get(f"http://{host}:{port}/health", timeout=timeout)
         payload = resp.json()
     except Exception as exc:
         click.echo(f"Health check failed: {exc}", err=True)
-        sys.exit(1)
+        sys.exit(3)
 
     if service:
-        result = payload.get("services", {}).get(service, {"error": "not found"})
-        click.echo(json.dumps(result, indent=2))
-    else:
+        services = payload.get("services", {})
+        payload = {**payload, "services": {
+            service: services.get(service,
+                                  {"status": "unhealthy", "message": "not found"})}}
+
+    if fmt == "json":
         click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(_render_health_text(payload, use_color=(os.name != "nt")))
+
+    sys.exit(_EXIT_BY_SCORE.get(payload.get("overall_score", 2), 3))
 
 
 @cli.command()

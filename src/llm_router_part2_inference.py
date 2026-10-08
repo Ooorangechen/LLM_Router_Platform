@@ -15,6 +15,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from src.utils.schema import QueryRequest, InferenceResponse
 from src.utils.logger import get_logger
 from src.utils.metrics import INFERENCE_METRICS
+from datetime import datetime, timezone
+from src.llm_router_part4_monitor import HealthStatus
 
 if TYPE_CHECKING:
     from src.llm_router_part1_router import ModelRouter, TokenCounter
@@ -219,6 +221,23 @@ class ResponseCache:
         except Exception as exc:
             self.enabled = False
             logger.warning("Redis initialization failed; cache disabled: %s", exc)
+
+    async def get_health_status(self) -> HealthStatus:
+        now = datetime.now(timezone.utc)
+        if not self.enabled or self.redis_client is None:
+            return HealthStatus(
+                service_name="cache", status="healthy", message="cache disabled",
+                last_check_at=now, metadata={"enabled": self.enabled},
+            )
+        try:
+            await asyncio.wait_for(self.redis_client.ping(), timeout=0.5)
+            status, message = "healthy", "redis ping OK"
+        except Exception as exc:
+            status, message = "degraded", f"redis unreachable: {exc}"
+        return HealthStatus(
+            service_name="cache", status=status, message=message,
+            last_check_at=now, metadata={"enabled": self.enabled, "ttl": self.ttl},
+        )
 
     async def get_cached_response(self, cache_key: str, model_name: str) -> Optional[Dict[str, Any]]:
         """GET and decode JSON; count hits/misses; disabled/errors return None.
@@ -642,19 +661,28 @@ class InferenceEngine:
         INFERENCE_METRICS.tokens_total.labels(model_name=response.model_name).inc(response.token_count_input + response.token_count_output)
         INFERENCE_METRICS.cost_usd_total.labels(model_name=response.model_name).inc(response.cost_usd)
 
-    def get_health_status(self) -> Dict[str, Any]:
+    async def get_health_status(self) -> HealthStatus:
         """Aggregate provider health, enabled cache/compression and engine stats."""
         providers = {
             name: provider.get_health_status()
             for name, provider in self.providers.items()
         }
-        return {
-            "healthy": any(status.get("status") == "healthy" for status in providers.values()),
-            "providers": providers,
-            "cache_enabled": self.cache.enabled,
-            "compression_enabled": self.context_compressor.enabled,
-            "inference_stats": dict(self.inference_stats),
-        }
+        ok = any(status.get("status") == "healthy" for status in providers.values())
+        ready = [p for p, s in providers.items() if s.get("status") == "healthy"]
+        return HealthStatus(
+            service_name="inference",
+            status="healthy" if ok else "unhealthy",
+            message=(f"{len(ready)} providers ready ({', '.join(ready)})"
+                     if ok else "No provider available"),
+            last_check_at=datetime.now(timezone.utc),
+            metadata={
+                "healthy": ok,
+                "providers": providers,
+                "cache_enabled": self.cache.enabled,
+                "compression_enabled": self.context_compressor.enabled,
+                "inference_stats": dict(self.inference_stats),
+            },
+        )
 
     async def shutdown(self) -> None:
         """Close initialized provider clients and Redis client."""

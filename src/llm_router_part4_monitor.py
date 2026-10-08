@@ -218,7 +218,7 @@ class SystemResourceCollector:
             uptime_seconds=0,
         )
     
-    def get_health_status(self) -> HealthStatus:
+    async def get_health_status(self) -> HealthStatus:
         """Operational health infomation"""
         now = datetime.now(timezone.utc)
         meta: Dict[str, Any] = {
@@ -572,7 +572,7 @@ class AlertManager:
         orderd = sorted(self._history, key = lambda r: r.fired_at, reverse=True)
         return orderd[:limit]
 
-    def get_health_status(self) -> HealthStatus:
+    async def get_health_status(self) -> HealthStatus:
         from collections import Counter
         now = datetime.now(timezone.utc)
         active_by_sev = dict(Counter(r.severity for r in self._active.values()))

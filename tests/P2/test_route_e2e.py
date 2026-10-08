@@ -45,9 +45,9 @@ async def test_real_route_e2e():
         status(3, f"Available providers: {provider_names}")
         assert provider_names, "No real provider initialized; check .env API keys"
 
-        health = inference.get_health_status()
-        status(4, f"Inference health: healthy={health['healthy']}, providers={health['providers']}")
-        assert health["healthy"] is True
+        health = await inference.get_health_status()
+        status(4, f"Inference health: status={health.status}, providers={health.metadata['providers']}")
+        assert health.status == "healthy"
 
         status(5, f"Redis cache ready: enabled={inference.cache.enabled}")
         assert inference.cache.enabled and inference.cache.redis_client is not None, (

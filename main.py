@@ -169,6 +169,7 @@ class LLMRouterPlatform:
         inference = InferenceEngine(self.config["inference"], router=router)
         await inference.initialize()
         self.services["inference"] = inference
+        self.services["cache"] = inference.cache
 
         # P4: resource collector + alert manager, only when monitoring is on.
         monitoring_cfg = self.config.get("monitoring", {})
@@ -203,57 +204,20 @@ class LLMRouterPlatform:
 
         self.logger.info("All services initialized successfully")
 
-    def _build_health_status(self, services) -> Tuple[str, int, Dict]:
-        """Traverse services into {status, message, last_check_at} per service,
-        then aggregate into (overall_status, overall_score, services_dict).
-
-        Per-service handling (shapes differ, so dispatch by name):
-          - monitor / alert : return a HealthStatus (part4) -> use as-is;
-          - inference       : P2-frozen {"healthy": bool, "providers": {...}} -> map;
-          - pipeline        : no health method -> derive from enabled/kafka/ch;
-          - router          : no health method -> models count (initialize()
-                              guarantees >=1), richer than the bare default;
-          - others          : P4 default healthy(message="registered").
-        """
+    async def _build_health_status(self, services) -> Tuple[str, int, Dict]:
         now = datetime.now(timezone.utc).isoformat()
         svc: Dict[str, Dict] = {}
         for name, service in services.items():
             try:
-                if name in ("monitor", "alert"):
-                    entry = service.get_health_status().model_dump(mode="json")
-                elif name == "inference":
-                    raw = service.get_health_status()
-                    ready = [p for p, s in raw.get("providers", {}).items()
-                             if s.get("status") == "healthy"]
-                    ok = raw.get("healthy", False)
-                    entry = {
-                        "status": "healthy" if ok else "unhealthy",
-                        "message": (f"{len(ready)} providers ready "
-                                    f"({', '.join(ready)})"
-                                    if ok else "no provider available"),
-                        "last_check_at": now,
-                    }
-                elif name == "pipeline":
-                    if not getattr(service, "enabled", False):
-                        status, message = "healthy", "disabled"
-                    else:
-                        kafka_ok = service.producer.enabled
-                        ch_ok = service.ch_writer.enabled
-                        if kafka_ok and ch_ok:
-                            status, message = "healthy", "kafka+clickhouse ok"
-                        else:
-                            status = "degraded"
-                            message = f"kafka={kafka_ok}, clickhouse={ch_ok}"
-                    entry = {"status": status, "message": message,
-                             "last_check_at": now}
-                elif name == "router":
-                    n = len(getattr(service, "models", {}) or {})
-                    entry = {"status": "healthy",
-                             "message": f"{n} models loaded",
-                             "last_check_at": now}
-                else:
+                probe = getattr(service, "get_health_status", None)
+                if probe is None:
                     entry = {"status": "healthy", "message": "registered",
                              "last_check_at": now}
+                else:
+                    result = await probe()
+                    d = result.model_dump(mode="json")
+                    entry = {"status": d["status"], "message": d["message"],
+                             "last_check_at": d["last_check_at"]}
             except Exception as exc:
                 entry = {"status": "unhealthy",
                          "message": f"health check error: {exc}",
@@ -370,7 +334,7 @@ class LLMRouterPlatform:
         @app.get("/health")
         async def health():
             from fastapi.responses import JSONResponse
-            overall, score, svc = self._build_health_status(self.services)
+            overall, score, svc = await self._build_health_status(self.services)
             body = {
                 "status": overall,
                 "overall_score": score,
@@ -675,7 +639,7 @@ def cli():
 
 @cli.command()
 def setup():
-    """初始化项目目录结构与模板文件。"""
+    """initialize project enviornment and templates."""
     try:
         setup_project_environment()
         click.echo("Setup completed.")
@@ -690,6 +654,7 @@ def setup():
 @click.option("--dev", is_flag=True, default=False,
               help="Dev: auto restart after code changes")
 def start(config_path, dev):
+    """Start the llm router"""
     if dev:
         import uvicorn
         os.environ["LLM_ROUTER_DEV_MODE"] = "true"

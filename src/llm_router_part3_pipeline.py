@@ -9,15 +9,13 @@ from typing import Annotated, Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 from src.utils.schema import RoutingDecision, InferenceResponse, QueryRequest
 from src.utils.metrics import PIPELINE_METRICS
+from src.llm_router_part4_monitor import HealthStatus
 import asyncio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from src.utils.constants import ClickHouseTables, KafkaTopics
 from src.utils.logger import get_logger
 from tenacity import retry, stop_after_attempt
 
-# Decision: import clickhouse_connect optionally. P3 lists it as a hard
-# dependency (D2), but a missing driver must degrade the writer the same way a
-# refused connection does instead of breaking `import` for pipeline.enabled=False.
 try:
     import clickhouse_connect
     from clickhouse_connect.driver import httputil
@@ -981,6 +979,27 @@ class PipelineManager:
             self.logger.info("PipelineManager initialized")
         else:
             self.logger.info("Pipeline skipped: Kafka/ClickHouse not available")
+
+    async def get_health_status(self) -> HealthStatus:
+
+        kafka_ok = self.producer.enabled
+        ch_ok = self.ch_writer.enabled
+
+        if not self.enabled:
+            status, message = "healthy", "pipeline disabled"
+        elif kafka_ok and ch_ok:
+            status, message = "healthy", "kafka and clickhouse both enabled"
+        else:
+            status = "degraded"
+            message = (f"pipeline.enabled=True but "
+                       f"kafka={kafka_ok}, clickhouse={ch_ok}")
+        return HealthStatus(
+            service_name="pipeline",
+            status=status,
+            message=message,
+            last_check_at=datetime.now(timezone.utc),
+            metadata={"kafka_ok": kafka_ok, "clickhouse_ok": ch_ok},
+        )
 
     async def start_consumer(self) -> None:
         await self.consumer.start()

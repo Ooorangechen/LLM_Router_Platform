@@ -8,6 +8,8 @@ from src.utils.logger import get_logger
 from src.utils.metrics import ROUTER_METRICS
 from src.utils.schema import ModelConfig, QueryRequest, QueryType, RoutingDecision
 from typing import Dict, List, Tuple, Any, Optional, Callable
+from datetime import datetime, timezone
+from src.llm_router_part4_monitor import HealthStatus
 
 logger = get_logger(__name__)
 
@@ -554,6 +556,19 @@ class ModelRouter:
         self.model_stats: Dict[str, Dict[str, Any]] = {}
         self._request_count = 0
         self._is_initialized = False
+
+    async def get_health_status(self) -> HealthStatus:
+        n = len(self.models)
+        return HealthStatus(
+            service_name="router",
+            status="healthy",
+            message=f"{n} models loaded",
+            last_check_at=datetime.now(timezone.utc),
+            metadata={
+                "default_model": self.default_model,
+                "strategy": self.routing_strategy,
+            },
+        )
 
     async def initialize(self) -> None:
         """Load configuration-backed state and initialize dependencies."""

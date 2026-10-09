@@ -77,3 +77,17 @@ Prometheus runs in a Docker container (`scripts/start_monitoring_stack.sh`, P4 Â
 
 - Existing `prom-p4`, `kafka-exp-p4` and `ch-exp-p4` containers were created with the old flags (old `--config.file`, no `--add-host`). Since the script reuses existing containers, remove them once (`docker rm -f prom-p4 kafka-exp-p4 ch-exp-p4`) and rerun the script.
 - The existing `ne-p4` container was created without `-p 9100:9100` and had to be recreated once (`docker rm -f ne-p4`, then rerun the start script), since the script reuses existing containers.
+
+---
+
+## ADJ-003: Serve `/metrics` without a trailing-slash redirect
+
+**Date**: 2026-10-09
+
+### What changed
+
+`main.py` now routes `GET /metrics` directly to the same `make_asgi_app()` instance mounted at `/metrics/`. Both paths return metrics with HTTP 200, without a 307 redirect. The Prometheus scrape path remains `/metrics`.
+
+### Why
+
+Starlette's mount matches `/metrics/`, so a request to `/metrics` previously received a 307 redirect. The acceptance test client follows redirects by default, which hid the initial response. A unit test now requests both paths with redirects disabled and checks for metrics content.

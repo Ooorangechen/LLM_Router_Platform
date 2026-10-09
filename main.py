@@ -334,8 +334,16 @@ class LLMRouterPlatform:
         # P4 Mode A: mount /metrics on the API port (default on).
         metrics_expose_cfg = self.config.get("monitoring", {}).get("metrics_expose", {})
         if _PROM_AVAILABLE and metrics_expose_cfg.get("use_fastapi_mount", True):
-            app.mount("/metrics", make_asgi_app())
-            self.logger.info("Mounted /metrics via make_asgi_app")
+            metrics_app = make_asgi_app()
+
+            class MetricsRoot:
+                async def __call__(self, scope, receive, send):
+                    await metrics_app(scope, receive, send)
+
+            # A Mount only matches /metrics/; expose the exact path without a 307.
+            app.add_route("/metrics", MetricsRoot(), methods=["GET"], include_in_schema=False)
+            app.mount("/metrics", metrics_app)
+            self.logger.info("Mounted /metrics and /metrics/ via make_asgi_app")
 
         @app.get("/health")
         async def health():

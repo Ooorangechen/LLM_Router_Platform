@@ -22,6 +22,18 @@ def _client(make_platform, services=None, config=None):
     return TestClient(platform._create_fastapi_app())
 
 
+def test_metrics_paths_return_data_without_redirect(make_platform):
+    with _client(make_platform) as client:
+        responses = [client.get(path, follow_redirects=False)
+                     for path in ("/metrics", "/metrics/")]
+
+    for response in responses:
+        assert response.status_code == 200
+        assert "location" not in response.headers
+        assert "# HELP" in response.text
+        assert "text/plain" in response.headers["content-type"]
+
+
 # ---------- /health ----------
 
 @pytest.mark.parametrize("statuses, overall, score, http_code", [

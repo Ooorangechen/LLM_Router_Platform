@@ -26,7 +26,7 @@ def server(server_factory):
 
 def _metrics(server):
     with server.client() as client:
-        result = client.get("/metrics")
+        result = client.get("/metrics", follow_redirects=False)
     assert result.status_code == 200
     return result.text
 

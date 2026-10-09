@@ -12,11 +12,10 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, TYPE_CHECKING
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.utils.schema import QueryRequest, InferenceResponse
+from src.utils.schema import QueryRequest, InferenceResponse, HealthStatus
 from src.utils.logger import get_logger
 from src.utils.metrics import INFERENCE_METRICS
 from datetime import datetime, timezone
-from src.llm_router_part4_monitor import HealthStatus
 
 if TYPE_CHECKING:
     from src.llm_router_part1_router import ModelRouter, TokenCounter

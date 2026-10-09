@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 from fastapi.testclient import TestClient
 
-from src.llm_router_part4_monitor import HealthStatus
+from src.utils.schema import HealthStatus
 
 
 def _service(status, message="ok"):

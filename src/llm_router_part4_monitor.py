@@ -7,6 +7,7 @@ import asyncio
 from collections import deque
 from src.utils.logger import get_logger
 from src.utils.metrics import INFERENCE_METRICS, ALERT_METRICS
+from src.utils.schema import HealthStatus
 import os
 import platform # consider both windows / linux, mac
 from abc import abstractmethod, ABC
@@ -40,15 +41,6 @@ class ResourceSnapshot(BaseModel):
     process_count: int
     open_fds_count: int 
     uptime_seconds: float 
-
-class HealthStatus(BaseModel):
-    """Sub-service health status, reused by /health"""
-    service_name: str
-    status: str # healthy, degraded, unhealthy
-    message: str
-    last_check_at: datetime # UTC
-    metadata: Dict[str, Any] = {}
-
 
 class SystemResourceCollector:
     def __init__(self, config: Dict[str, Any]) -> None:

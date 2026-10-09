@@ -15,6 +15,7 @@ Models:
 - ModelConfig
 - SystemMetric
 - UserSession
+- HealthStatus
 
 Constraint:
 - No import from logger/metrics/router etc. 
@@ -236,4 +237,13 @@ class UserSession(BaseModel):
     user_id: str
     user_tier: UserTier
     start_time: datetime = Field(default_factory=datetime.now)
+
+
+class HealthStatus(BaseModel):
+    """Sub-service health status, reused by /health"""
+    service_name: str
+    status: str # healthy, degraded, unhealthy
+    message: str
+    last_check_at: datetime # UTC
+    metadata: Dict[str, Any] = {}
         

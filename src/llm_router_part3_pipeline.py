@@ -7,9 +7,8 @@ from uuid import UUID, uuid4
 from pydantic import AfterValidator, BaseModel, Field
 from typing import Annotated, Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
-from src.utils.schema import RoutingDecision, InferenceResponse, QueryRequest
+from src.utils.schema import RoutingDecision, InferenceResponse, QueryRequest, HealthStatus
 from src.utils.metrics import PIPELINE_METRICS
-from src.llm_router_part4_monitor import HealthStatus
 import asyncio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from src.utils.constants import ClickHouseTables, KafkaTopics

@@ -6,10 +6,9 @@ from time import perf_counter
 from dataclasses import dataclass
 from src.utils.logger import get_logger
 from src.utils.metrics import ROUTER_METRICS
-from src.utils.schema import ModelConfig, QueryRequest, QueryType, RoutingDecision
+from src.utils.schema import ModelConfig, QueryRequest, QueryType, RoutingDecision, HealthStatus
 from typing import Dict, List, Tuple, Any, Optional, Callable
 from datetime import datetime, timezone
-from src.llm_router_part4_monitor import HealthStatus
 
 logger = get_logger(__name__)
 

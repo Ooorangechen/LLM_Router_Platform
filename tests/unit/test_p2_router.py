@@ -146,13 +146,13 @@ def test_exception_fallback_and_metrics_isolation(router):
     assert decision.confidence == 0.0
     assert "Fallback due to error" in decision.routing_reason
     with patch("src.llm_router_part1_router.ROUTER_METRICS") as metrics:
-        metrics.routing_duration.observe.side_effect = RuntimeError("metrics failed")
+        metrics.routing_duration_seconds.observe.side_effect = RuntimeError("metrics failed")
         decision = run(router, user_tier="premium")
         assert decision.selected_model == "gpt-a"
         metrics.routing_decisions.labels.assert_called_once_with(
-            model="gpt-a", query_type="code_generation"
+            selected_model="gpt-a", query_type="code_generation", strategy="intelligent"
         )
-        assert 0 <= metrics.routing_duration.observe.call_args.args[0] < 1
+        assert 0 <= metrics.routing_duration_seconds.observe.call_args.args[0] < 1
 
 
 def test_stats_influence_score_and_bad_updates_do_not_break_requests(router):

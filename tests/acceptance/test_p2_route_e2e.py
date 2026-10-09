@@ -1,12 +1,10 @@
-"""Real POST /route E2E acceptance test.
+"""Real POST /route E2E acceptance test (P2 §5.4 + §5.6).
 
 This test uses a real provider and Redis, so it is skipped by default. Run it
 from the project root with output enabled:
 
-RUN_ROUTE_E2E_TEST=1 venv/bin/python -m pytest tests/test_route_e2e.py -q -s
+venv/bin/python -m pytest tests/acceptance/test_p2_route_e2e.py --run-external -q -s
 """
-
-import os
 
 import httpx
 import pytest
@@ -15,13 +13,7 @@ from main import LLMRouterPlatform
 from src.utils.schema import QueryRequest
 
 
-pytestmark = [
-    pytest.mark.asyncio,
-    pytest.mark.skipif(
-        os.getenv("RUN_ROUTE_E2E_TEST") != "1",
-        reason="Real /route E2E test requires explicit opt-in",
-    ),
-]
+pytestmark = pytest.mark.asyncio
 
 
 def status(step: int, message: str) -> None:

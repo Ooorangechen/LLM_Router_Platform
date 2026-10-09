@@ -1,40 +1,26 @@
 """真实 provider smoke tests（每项含一次普通调用和一次流式调用，可能产生费用）。
 
 从项目根目录运行，例如仅测试 OpenAI：
-RUN_PROVIDER_SMOKE=1 .venv/bin/python -m pytest tests/test_provider_smoke.py::test_openai -q -s
+venv/bin/python -m pytest tests/integration/test_p2_provider_smoke.py::test_openai --run-external -q -s
 
-去掉 ::test_openai 可测试全部三个 provider；普通 pytest 默认跳过本文件。
+去掉 ::test_openai 可测试全部三个 provider；不加 --run-external 时默认跳过。
 读取 config/config.yaml，每个 provider 选择其第一个配置模型。
 自动加载根目录 .env，不覆盖已有环境变量。vLLM 需要事先启动对应服务。
 这里只测 provider，不创建 Router，也不加载 tokenizer、缓存或压缩器。
 """
 
-import os
-from pathlib import Path
-
 import pytest
-import yaml
 
 from src.llm_router_part2_inference import OpenAIProvider, AnthropicProvider, vLLMProvider
 from src.utils.schema import ModelConfig, QueryRequest
 
 
-pytestmark = [
-    pytest.mark.asyncio,
-    pytest.mark.skipif(
-        os.getenv("RUN_PROVIDER_SMOKE") != "1",
-        reason="真实请求需显式设置 RUN_PROVIDER_SMOKE=1",
-    ),
-]
+pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-def config():
-    from dotenv import load_dotenv
-
-    root = Path(__file__).resolve().parents[1]
-    load_dotenv(root / ".env", override=False)
-    return yaml.safe_load((root / "config/config.yaml").read_text(encoding="utf-8"))
+def config(app_config):
+    return app_config
 
 
 def models_for(config, provider_name):

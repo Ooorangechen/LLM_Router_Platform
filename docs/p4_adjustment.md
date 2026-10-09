@@ -40,3 +40,36 @@ The Prometheus route was chosen over the ClickHouse-only one so that per-tier la
 
 - Per-tier alert rules (tier-specific latency SLO thresholds) are not yet added to `monitoring/alert_rules.yml`.
 - The M3 / §5.4 "Total Requests (Window)" stat panel discrepancy is tracked separately and intentionally left as-is pending confirmation (see conversation notes), not part of this adjustment.
+
+---
+
+## ADJ-002: Scrape host-side targets via `host.docker.internal`
+
+**Date**: 2026-10-08
+
+**Decision**: Approved.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `monitoring/prometheus.yml` | Targets of `llm-router-api`, `llm-router-inference`, `vllm-server`, `kafka-exporter`, `clickhouse-exporter`, `node-exporter` changed from `localhost:<port>` to `host.docker.internal:<port>`. `prometheus-self` stays `localhost:9090`; the `alerting` target (`localhost:9093`) is unchanged since no Alertmanager runs locally. Job names, ports and scrape intervals are unchanged. |
+
+### Why
+
+Prometheus runs in a Docker container (`scripts/start_monitoring_stack.sh`, P4 §5.1). Inside the container `localhost` is the container itself, so every target except `prometheus-self` was DOWN, including `llm-router-api`, which M3 requires to be UP. The service runs on the host and the exporters publish their ports on the host, so the container reaches all of them through `host.docker.internal`.
+
+### Deviation from P4.md
+
+- **P4.md §3.3** lists the scrape targets as `localhost:<port>`. The 7 job names, ports and intervals required by §3.3 are unchanged; only the host part differs.
+
+### Compatibility / risk
+
+- `host.docker.internal` resolves by default on Docker Desktop (macOS/Windows). On Linux the Prometheus container needs `--add-host=host.docker.internal:host-gateway`; the start script does not add it yet.
+- A Prometheus binary run directly on the host (not in Docker) cannot resolve `host.docker.internal`; it would need the `localhost` targets back.
+- The `prometheus.yml` template in `src/llm_router_part0_setup.py` still uses `localhost`. `setup` only writes the file when it is missing, so the repository copy is not affected.
+
+### Follow-up / not done here
+
+- Add `--add-host=host.docker.internal:host-gateway` to the Prometheus `docker run` in `scripts/start_monitoring_stack.sh` if the stack must run on Linux.
+- The existing `ne-p4` container was created without `-p 9100:9100` and had to be recreated once (`docker rm -f ne-p4`, then rerun the start script), since the script reuses existing containers.

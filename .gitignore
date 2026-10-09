@@ -23,6 +23,8 @@ logs/
 data/queries/
 data/processed/
 data/feedback/
+data/grafana
+data/prometheus
 
 # --- Model weights ---
 *.bin

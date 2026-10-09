@@ -1,7 +1,7 @@
 # src/llm_router_part0_setup.py
 # public class: ProjectSetup
 # public function: setup_project_environment()
-# P1 scaffold: create directories, write template files, create venv,
+# P1–P4 scaffold: create directories, write template files, create venv,
 # install dependencies, then validate the resulting environment.
 # Every step is idempotent: running setup twice must never raise.
 
@@ -29,6 +29,8 @@ REQUIRED_DIRS = [
     "config",
     "data",
     "data/queries",
+    "data/prometheus",
+    "data/grafana",
     "data/processed/routed",
     "docker",
     ".github/workflows",
@@ -88,6 +90,9 @@ loguru>=0.7
 
 # 指标采集
 prometheus-client>=0.19
+# P4 resource collection (GPU support is optional)
+psutil>=5.9
+GPUtil>=1.4.0; sys_platform != 'darwin'
 
 # CLI 命令框架
 click>=8.1
@@ -168,7 +173,7 @@ logging:
 router:
   default_model: mistral-7b
   routing_strategy: intelligent
-  models: 
+  models:
     mistral-7b:
       provider: vllm
       api_key_env: VLLM_API_KEY
@@ -212,7 +217,7 @@ router:
         - general
         - coding
       model_path: null
-    llama-3.1-70b: 
+    llama-3.1-70b:
       provider: vllm
       api_key_env: VLLM_API_KEY
       max_tokens: 131072
@@ -294,7 +299,7 @@ inference:
     enabled: true
     max_batch_size: 32
     max_wait_time_ms: 50
-  
+
 kafka:
   bootstrap_servers: localhost:9092
   topics_file: kafka/topics.json
@@ -306,7 +311,7 @@ kafka:
     metrics: llm-metrics
     errors: llm-errors
     dead_letter: llm-dead-letter
-  
+
   producer:
     acks: all
     retries: 3
@@ -316,7 +321,7 @@ kafka:
     request_timeout_ms: 30000
     max_in_flight: 5
     enable_idempotence: true
-  
+
   consumer:
     group_id: llm-router-clickhouse-consumer
     auto_offset_reset: earliest
@@ -348,26 +353,57 @@ clickhouse:
 
 monitoring:
   enabled: false
-  prometheus_port: 8000
+  alert_enabled: true
+  resource_collector:
+    enabled: true
+    interval_sec: 15
+    disk_path: /
+    net_iface: null # null means sum of all interfaces
+    gpu_enabled: true
+
+  prometheus_server:
+    enabled: false # disabled by default, use mode A /metrics
+    port: 9101
+    addr: 0.0.0.0
+  metrics_expose:
+    use_fastapi_mount: true # app.mount("/metrics")
 
   prometheus:
+    server_url: http://localhost:9090
+    alert_rules_file: monitoring/alert_rules.yml
+    config_file: monitoring/prometheus.yml
     scrape_interval_seconds: 15
-  
+
   grafana:
     port: 3000
     admin_user: admin
     admin_password_env: GRAFANA_ADMIN_PASSWORD
-  
+
   alerts:
     error_rate_threshold: 0.05
     latency_p95_threshold_seconds: 2.0
     cpu_usage_threshold: 0.85
     memory_usage_threshold: 0.85
-  
+
   health_checks:
     interval_seconds: 30
     timeout_seconds: 5
-  
+
+  alert_manager:
+    eval_interval_sec: 15
+    rules_override: []
+    suppress_duplicate_seconds: 300
+    history_max_size: 1000
+    notifiers:
+      stdout: { enabled: true }
+      slack:
+        enabled: false
+        webhook_url_env: SLACK_ALERT_WEBHOOK_URL
+        channel: "#alerts"
+        mention: "@oncall"
+      email: { enabled: false, smtp_host: "", smtp_port: 587, username_env: "", password_env: "", from_addr: "", to_addrs: [] }
+      pagerduty: { enabled: false, routing_key_env: PAGERDUTY_ROUTING_KEY }
+
 slack:
   enabled: false
   bot_token_env: SLACK_BOT_TOKEN
@@ -377,12 +413,12 @@ slack:
   channels:
     - general
     - llm-router-alerts
-  
+
   response_settings:
     max_response_length: 3000
     thread_replies: true
     typing_indicator: true
-  
+
   rate_limiting:
     enabled: true
     rpm: 20
@@ -396,11 +432,11 @@ streamlit:
     mode: dark
     primary_color: "#FF6B6B"
     background_color: "#0E1117"
-  
+
   dashboard:
     refresh_interval_seconds: 10
     default_time_range_hours: 24
-  
+
 flink:
   enabled: false
   job_name: LLM Router Analytics
@@ -418,7 +454,7 @@ security:
   api_keys:
     enabled: false
     header_name: X-API-Key
-  jwt: 
+  jwt:
     enabled: false
     secret_env: JWT_SECRET
     algorithm: HS256
@@ -449,7 +485,7 @@ performance:
     heap_size_mb: 2048
     gc_threshold: 0.8
 
-development: 
+development:
   debug: false
   auto_reload: false
   profiling: false
@@ -478,7 +514,7 @@ adapters:
     strategy: static
     canary:
       enabled: false
-      stages: 
+      stages:
         - 5
         - 20
         - 100
@@ -489,10 +525,10 @@ adapters:
     epochs: 3
     batch_size: 8
 
-policies: 
+policies:
   quota:
     tier_quotas:
-      free: 
+      free:
         daily: 100
         hourly: 10
       premium:
@@ -507,18 +543,18 @@ policies:
       free: 10.0
       premium: 5.0
       enterprise: 2.0
-  
-  budget: 
+
+  budget:
     cost_budgets:
       free: 0.01
       premium: 0.10
       enterprise: 1.00
-  
-  circuit_breaker: 
+
+  circuit_breaker:
     enabled: false
     failure_threshold: 5
     recovery_timeout_seconds: 30
-  
+
 optimization:
   enabled: false
   kv_cache_size_gb: 8
@@ -537,10 +573,10 @@ quality:
     availability: 0.999
     latency_p95_seconds: 2.0
     error_rate_max: 0.01
-  
+
   feedback:
     storage_path: data/feedback
-  
+
   health_check_interval_seconds: 30
 
 router_mode:
@@ -562,7 +598,7 @@ class _PrintLogger:
 
 
 class ProjectSetup:
-    """P1 project scaffold: directories, template files, venv, dependencies, validation."""
+    """P1–P4 project scaffold: directories, templates, venv, dependencies, validation."""
 
     def __init__(self, project_root: str = ".", logger=None):
         self.project_root = Path(project_root).resolve()
@@ -571,7 +607,7 @@ class ProjectSetup:
         self.required_dirs = list(REQUIRED_DIRS)
         self.package_dirs = list(PACKAGE_DIRS)
 
-        # 3.1.2 the 10 template files: relative path -> content builder
+        # P1–P4 template files: relative path -> content builder
         self.required_files = {
             ".gitignore": self._template_gitignore,
             "README.md": self._template_readme,
@@ -580,6 +616,7 @@ class ProjectSetup:
             "kafka/topics.json": self._template_kafka_topics,
             "clickhouse/schema.sql": self._template_clickhouse_schema,
             "monitoring/prometheus.yml": self._template_prometheus,
+            "monitoring/alert_rules.yml": self._template_alert_rules,
             "monitoring/grafana/dashboard.json": self._template_grafana_dashboard,
             "streamlit_ui/config.toml": self._template_streamlit_config,
             ".github/workflows/ci.yml": self._template_ci_workflow,
@@ -753,6 +790,8 @@ logs/
 data/queries/
 data/processed/
 data/feedback/
+data/prometheus/
+data/grafana/
 
 # --- Model weights ---
 *.bin
@@ -807,7 +846,8 @@ override with `python main.py start --config path/to/override.yaml`.
 
 ## Layout
 
-See `docs/P1.md`, `docs/P2.md`, and `docs/P3.md` for the phased architecture.
+See `docs/P1.md`, `docs/P2.md`, `docs/P3.md`, and `docs/P4.md`
+for the phased architecture and monitoring setup.
 """
 
     @staticmethod
@@ -876,11 +916,13 @@ See `docs/P1.md`, `docs/P2.md`, and `docs/P3.md` for the phased architecture.
 
     @staticmethod
     def _template_prometheus() -> str:
-        return """\
-# P1 template, activated in P4
-global:
+        return r"""global:
   scrape_interval: 15s
   evaluation_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: llm-router-local
+    environment: dev
 
 rule_files:
   - "alert_rules.yml"
@@ -891,75 +933,515 @@ alerting:
         - targets: ["localhost:9093"]
 
 scrape_configs:
-  - job_name: "api"
+  - job_name: llm-router-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:8080"]
+        labels: { tier: "api" }
+    scrape_interval: 5s
+
+  - job_name: llm-router-inference
+    metrics_path: /metrics
+    params: { component: ["inference"] }
+    static_configs:
+      - targets: ["localhost:8080"]
+    scrape_interval: 10s
+
+  - job_name: vllm-server
+    metrics_path: /metrics
     static_configs:
       - targets: ["localhost:8000"]
+    scrape_interval: 10s
+    honor_labels: true
 
-  - job_name: "inference"
-    static_configs:
-      - targets: ["localhost:8001"]
-
-  - job_name: "vllm"
-    static_configs:
-      - targets: ["localhost:8002"]
-
-  - job_name: "kafka-exporter"
+  - job_name: kafka-exporter
     static_configs:
       - targets: ["localhost:9308"]
+    scrape_interval: 30s
 
-  - job_name: "clickhouse-exporter"
+  - job_name: clickhouse-exporter
     static_configs:
       - targets: ["localhost:9116"]
+    scrape_interval: 30s
 
-  - job_name: "node-exporter"
+  - job_name: node-exporter
     static_configs:
       - targets: ["localhost:9100"]
+    scrape_interval: 15s
 
-  - job_name: "prometheus"
+  - job_name: prometheus-self
     static_configs:
       - targets: ["localhost:9090"]
+    scrape_interval: 15s
+"""
+
+    @staticmethod
+    def _template_alert_rules() -> str:
+        return r"""groups:
+  - name: llm-router.rules
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (model_name) (rate(
+            {__name__=~"llm_router_inference_requests_total|inference_requests_total", status="error"}[5m]
+          ))
+          /
+          sum by (model_name) (rate(
+            {__name__=~"llm_router_inference_requests_total|inference_requests_total"}[5m]
+          ))
+          > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          team: llm-platform
+        annotations:
+          summary: "High error rate (>5%)"
+          description: "model {{ $labels.model_name }} error rate {{ $value | humanizePercentage }}"
+
+      - alert: HighLatencyP95
+        expr: histogram_quantile(0.95, sum by (le,model_name) (rate(llm_router_inference_request_duration_seconds_bucket[5m]))) > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "P95 latency > 5s per model"
+          description: "model {{ $labels.model_name }} p95={{ $value }}s"
+
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes / on (job) group_left() machine_memory_bytes > 0.9
+              or llm_router_resource_memory_percent > 90
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "Memory usage > 90%" }
+
+      - alert: HighDiskUsage
+        expr: llm_router_resource_disk_percent > 80
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Disk usage > 80%" }
+
+      - alert: PipelineDLQAccumulating
+        expr: increase(llm_router_pipeline_dead_letter_total[10m]) > 10
+        for: 3m
+        labels: { severity: critical }
+        annotations: { summary: "Pipeline dead-letter accumulating" }
 """
 
     @staticmethod
     def _template_grafana_dashboard() -> str:
-        return """\
-{
-  "title": "LLM Router Platform - Overview",
-  "timezone": "browser",
-  "refresh": "10s",
+        return r"""{
+  "id": null,
+  "uid": "llm-router-main",
+  "title": "LLM Router Platform — Main Overview",
+  "description": "P4 main overview: RPS / P95 latency / success rate / cost stats, model distribution, per-model P95 trend, recent error queries (ClickHouse).",
+  "tags": ["llm-router", "platform", "mvp"],
+  "timezone": "utc",
+  "schemaVersion": 38,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
   "time": {
-    "from": "now-1h",
+    "from": "now-6h",
     "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["10s", "30s", "1m", "5m", "15m", "1h"]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {"text": "Prometheus", "value": "Prometheus"},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "definition": "label_values(llm_router_inference_requests_total, model_name)",
+        "query": {
+          "query": "label_values(llm_router_inference_requests_total, model_name)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {"text": ["All"], "value": ["$__all"]},
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "user_tier",
+        "label": "User Tier",
+        "description": "Queried from the user_tier label on llm_router_inference_requests_by_tier_total (P4 adjustment, parallel tier metric). Filters the per-tier latency panel and the ClickHouse error table.",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "$datasource"},
+        "definition": "label_values(llm_router_inference_requests_by_tier_total, user_tier)",
+        "query": {
+          "query": "label_values(llm_router_inference_requests_by_tier_total, user_tier)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {"text": ["All"], "value": ["$__all"]},
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "regex": "",
+        "options": []
+      },
+      {
+        "name": "env",
+        "label": "Env",
+        "description": "Informational only: prometheus.yml external_labels are not attached to locally stored series, so no query filters on env.",
+        "type": "custom",
+        "query": "dev,stg,prod",
+        "includeAll": false,
+        "multi": false,
+        "current": {"text": "dev", "value": "dev"},
+        "hide": 0,
+        "options": [
+          {"text": "dev", "value": "dev", "selected": true},
+          {"text": "stg", "value": "stg", "selected": false},
+          {"text": "prod", "value": "prod", "selected": false}
+        ]
+      },
+      {
+        "name": "ch_datasource",
+        "label": "ClickHouse",
+        "type": "datasource",
+        "query": "grafana-clickhouse-datasource",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      }
+    ]
   },
   "panels": [
     {
-      "id": 1,
-      "title": "Requests Per Second",
-      "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-      "targets": [
-        {"expr": "sum(rate(llm_router_requests_total[1m]))", "legendFormat": "rps"}
-      ]
-    },
-    {
       "id": 2,
-      "title": "P95 Latency",
-      "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "title": "Requests Per Second (RPS)",
+      "type": "stat",
+      "gridPos": {"x": 0, "y": 1, "w": 6, "h": 3},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(llm_router_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "p95"
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(rate(llm_router_inference_requests_total{model_name=~\"$model\"}[1m]))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "rps"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2,
+          "color": {"mode": "fixed", "fixedColor": "green"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
     },
     {
       "id": 3,
-      "title": "Model Distribution",
-      "type": "piechart",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "title": "P95 Response Latency (ms)",
+      "type": "stat",
+      "gridPos": {"x": 6, "y": 1, "w": 6, "h": 3},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
       "targets": [
-        {"expr": "sum by (model) (llm_router_router_routing_decisions_total)", "legendFormat": "{{model}}"}
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "1000 * histogram_quantile(0.95, sum by (le) (rate(llm_router_inference_request_duration_seconds_bucket{model_name=~\"$model\"}[5m])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 2000},
+              {"color": "red", "value": 5000}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Success Rate (%)",
+      "type": "stat",
+      "gridPos": {"x": 12, "y": 1, "w": 6, "h": 3},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "100 * sum(rate(llm_router_inference_requests_total{status=\"success\", model_name=~\"$model\"}[5m])) / sum(rate(llm_router_inference_requests_total{model_name=~\"$model\"}[5m]))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "success %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 95},
+              {"color": "green", "value": 99}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Cumulative Cost (Window)",
+      "description": "increase() over the selected time range ($__range, default 6h).",
+      "type": "stat",
+      "gridPos": {"x": 18, "y": 1, "w": 6, "h": 3},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum(increase(llm_router_inference_cost_usd_total{model_name=~\"$model\"}[$__range]))",
+          "instant": true,
+          "range": false,
+          "legendFormat": "cost"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "color": {"mode": "fixed", "fixedColor": "blue"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "blue", "value": null}]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "title": "Model Distribution (by Requests)",
+      "type": "piechart",
+      "gridPos": {"x": 0, "y": 4, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "sum by (model_name) (increase(llm_router_inference_requests_total{model_name=~\"$model\"}[$__range]))",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{model_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "donut",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "displayLabels": ["percent"],
+        "legend": {
+          "show": true,
+          "displayMode": "table",
+          "placement": "right",
+          "values": ["value", "percent"]
+        },
+        "tooltip": {"mode": "single", "sort": "none"}
+      }
+    },
+    {
+      "id": 7,
+      "title": "P95 Latency Trend by Model x User Tier (ms)",
+      "description": "One curve per model_name x user_tier, from the parallel tier metric added in the P4 adjustment (docs/p4_adjustment.md). Filtered by the $model and $user_tier variables.",
+      "type": "timeseries",
+      "gridPos": {"x": 8, "y": 4, "w": 16, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, model_name, user_tier) (rate(llm_router_inference_request_duration_by_tier_seconds_bucket{model_name=~\"$model\", user_tier=~\"$user_tier\"}[$__rate_interval])))",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{model_name}} / {{user_tier}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "thresholdsStyle": {"mode": "dashed"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "transparent", "value": null},
+              {"color": "yellow", "value": 2000},
+              {"color": "red", "value": 5000}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["mean", "max", "lastNotNull"]
+        },
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 9,
+      "title": "ClickHouse Details",
+      "type": "row",
+      "collapsed": true,
+      "gridPos": {"x": 0, "y": 12, "w": 24, "h": 1},
+      "panels": [
+        {
+          "id": 8,
+          "title": "Top 10 Recent Error Queries",
+          "description": "Requires the grafana-clickhouse-datasource plugin and a ClickHouse datasource selected in the ClickHouse variable.",
+          "type": "table",
+          "gridPos": {"x": 0, "y": 13, "w": 24, "h": 8},
+          "datasource": {"type": "grafana-clickhouse-datasource", "uid": "$ch_datasource"},
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {"type": "grafana-clickhouse-datasource", "uid": "$ch_datasource"},
+              "editorType": "sql",
+              "queryType": "table",
+              "format": 1,
+              "rawSql": "SELECT request_received_at, query_id, user_id, user_tier, selected_model AS model_name, latency_ms, error FROM query_logs WHERE status = 'error' AND $__timeFilter(request_received_at) AND user_tier IN (${user_tier:singlequote}) ORDER BY request_received_at DESC LIMIT 10"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "cellOptions": {"type": "auto"}
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {"id": "byName", "options": "error"},
+                "properties": [
+                  {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}},
+                  {"id": "custom.cellOptions", "value": {"type": "color-text"}}
+                ]
+              },
+              {
+                "matcher": {"id": "byName", "options": "latency_ms"},
+                "properties": [
+                  {"id": "unit", "value": "ms"},
+                  {"id": "color", "value": {"mode": "thresholds"}},
+                  {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "yellow", "value": 2000},
+                    {"color": "red", "value": 5000}
+                  ]}},
+                  {"id": "custom.cellOptions", "value": {"type": "color-text"}}
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "cellHeight": "sm",
+            "footer": {"show": false, "reducer": ["sum"], "fields": ""}
+          }
+        }
       ]
     }
   ]

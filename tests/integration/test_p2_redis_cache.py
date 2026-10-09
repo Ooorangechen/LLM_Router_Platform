@@ -1,12 +1,10 @@
 """Real Redis cache-only E2E test.
 
-No model provider is called. Run from the project root with:
+No model provider is called. Requires Redis (scripts/start_redis.sh). Run from
+the project root with:
 
-RUN_CACHE_E2E_TEST=1 venv/bin/python -m pytest tests/test_cache_e2e.py -q -s
+venv/bin/python -m pytest tests/integration/test_p2_redis_cache.py --run-external -q -s
 """
-
-import os
-from pathlib import Path
 
 import pytest
 import yaml
@@ -15,22 +13,15 @@ from src.llm_router_part2_inference import ResponseCache
 from src.utils.schema import InferenceResponse, QueryRequest
 
 
-pytestmark = [
-    pytest.mark.asyncio,
-    pytest.mark.skipif(
-        os.getenv("RUN_CACHE_E2E_TEST") != "1",
-        reason="Real Redis cache E2E test requires explicit opt-in",
-    ),
-]
+pytestmark = pytest.mark.asyncio
 
 
 def status(step: int, message: str) -> None:
     print(f"[{step}] {message}", flush=True)
 
 
-async def test_real_redis_cache_e2e():
-    root = Path(__file__).resolve().parents[1]
-    config = yaml.safe_load((root / "config/config.yaml").read_text(encoding="utf-8"))
+async def test_real_redis_cache_e2e(project_root):
+    config = yaml.safe_load((project_root / "config/config.yaml").read_text(encoding="utf-8"))
     cache_config = {**config["inference"]["cache"], "enabled": True, "ttl": 60}
     cache = ResponseCache(cache_config)
 

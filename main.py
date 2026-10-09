@@ -141,7 +141,7 @@ class LLMRouterPlatform:
         _PROM_AVAILABLE
         and monitoring_cfg.get("enabled", False)
         and prom_server_cfg.get("enabled", False)
-        and self.prom_server is None)
+        and self._prom_server is None)
     
     async def _initialize_services(self):
         """Initialize router, optional P3 pipeline, then inference."""
@@ -365,9 +365,9 @@ class LLMRouterPlatform:
             providers_ready = []
             if inference is not None:
                 try:
-                    health = inference.get_health_status()
+                    health = await inference.get_health_status()
                     providers_ready = [
-                        name for name, s in health.get("providers", {}).items()
+                        name for name, s in health.metadata.get("providers", {}).items()
                         if s.get("status") == "healthy"
                     ]
                 except Exception as exc:

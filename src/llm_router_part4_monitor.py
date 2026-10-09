@@ -313,6 +313,8 @@ class AlertManager:
         self._task = None
 
         self._prometheus_url = monitor_config.get("prometheus", {}).get("server_url", "http://localhost:9090")
+        # Set after a failed Prometheus query so repeats log at debug, not every eval round.
+        self._prometheus_down: bool = False
 
 
     async def initialize(self) -> None:
@@ -463,19 +465,27 @@ class AlertManager:
             async with  httpx.AsyncClient(timeout=2.0) as client:
                 resp = await client.get(f"{self._prometheus_url}/api/v1/query",
                 params={"query": query})
+            if self._prometheus_down:
+                self.logger.info("Prometheus reachable again at %s", self._prometheus_url)
+                self._prometheus_down = False
             if resp.status_code != 200:
                 return None
             payload = resp.json()
             if payload.get("status") != "success":
                 return None
             result = payload["data"]["result"]
+            if not result:                       # no latency samples yet
+                return None
             value = float(result[0]["value"][1])
             if value != value:
                 return None
             return value
         except Exception as e:
-            self.logger.warning("Prometheus P95 query failed: %s", e)
-            return None 
+            # Prometheus is optional (P4 M1): report the first failure at info, repeats at debug.
+            log = self.logger.debug if self._prometheus_down else self.logger.info
+            log("Prometheus P95 query failed: %s", e)
+            self._prometheus_down = True
+            return None
         
     def _snapshot_value(self, field:str) -> Optional[float]:
         collector = self.services_ref.get("monitor")
@@ -528,9 +538,9 @@ class AlertManager:
                 return None 
 
             # active and missing conditions continuously within duration, resolved
-            record = self._active.pop(rule_name)
-            record.status = "resolved"
-            record.resolved_at = now
+            # Copy instead of mutating: the firing record already in history must stay "firing".
+            fired = self._active.pop(rule_name)
+            record = fired.model_copy(update={"status": "resolved", "resolved_at": now})
             self._history.append(record)
             # recovered -> clear the suppression window so a new fire notifies at once
             self._last_notify_at.pop(rule_name, None)

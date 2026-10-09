@@ -222,7 +222,6 @@ def build_error_entry(
 
 
 # TASK 3.3: Kafka Producer Manager
-
 class KafkaProducerManager:
     """Publish pipeline events to Kafka, degrading to a no-op when unreachable."""
 
@@ -251,6 +250,7 @@ class KafkaProducerManager:
             "enable_idempotence": producer_config.get("enable_idempotence", True),
         }
         self.producer: Optional[AIOKafkaProducer] = None
+        self._is_alive = False
 
     async def initialize(self) -> None:
         """Connect to Kafka; on failure degrade to disabled without raising."""
@@ -259,6 +259,7 @@ class KafkaProducerManager:
 
         try:
             await self._connect()
+            self._is_alive = True
             self.logger.info(
                 "Kafka producer connected to %s", self.bootstrap_servers)
         except Exception as e:
@@ -281,6 +282,20 @@ class KafkaProducerManager:
                     pass
             raise
         self.producer = producer
+
+    async def probe(self, timeout_sec: float) -> bool:
+        alive = False
+        if self.producer is not None:
+            try:
+                await asyncio.wait_for(
+                    self.producer.client.fetch_all_metadata(), timeout_sec)
+                alive = True
+            except Exception as e:
+                self.logger.debug("Kafka probe failed: %s", e)
+        if alive != self._is_alive:
+            self.logger.info("Kafka connectivity changed: alive=%s", alive)
+        self._is_alive = alive
+        return alive
 
     # skipping optional async def _ensure_topics_exist(self):
 
@@ -345,6 +360,7 @@ class KafkaProducerManager:
         finally:
             self.producer = None
             self.enabled = False
+            self._is_alive = False
 
 
 # TASK 3.4: Kafka Consumer Engine + ClickHouse Writer
@@ -684,6 +700,8 @@ class ClickHouseWriter:
         self.tables = {table.value for table in ClickHouseTables}
 
         self.client: Optional[Any] = None
+        # Runtime connectivity, refreshed by PipelineManager's background probe.
+        self._is_alive = False
         self.schema_result: Tuple[int, int] = (0, 0)
         self._buffers: Dict[str, List[Dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
@@ -717,6 +735,7 @@ class ClickHouseWriter:
                 pool_mgr=httputil.get_pool_manager(maxsize=10),
             )
             await asyncio.to_thread(self.client.command, "SELECT 1")
+            self._is_alive = True
             self.logger.info(
                 "ClickHouse connected: %s:%s", self.host, self.port)
 
@@ -725,8 +744,24 @@ class ClickHouseWriter:
         except Exception as e:
             self.client = None
             self.enabled = False
+            self._is_alive = False
             self.logger.warning(
                 "ClickHouse writer disabled: connection failed: %s", e)
+
+    async def probe(self, timeout_sec: float) -> bool:
+        """GET /ping on the existing client; updates and returns _is_alive."""
+        alive = False
+        if self.client is not None:
+            try:
+                alive = await asyncio.wait_for(
+                    asyncio.to_thread(self.client.ping), timeout_sec)
+            except Exception as e:
+                self.logger.debug("ClickHouse probe failed: %s", e)
+        if alive != self._is_alive:
+            self.logger.info(
+                "ClickHouse connectivity changed: alive=%s", alive)
+        self._is_alive = alive
+        return alive
 
     async def _create_tables_if_not_exists(self) -> Tuple[int, int]:
         """Execute clickhouse/schema.sql; return (succeeded, failed) statements."""
@@ -943,6 +978,7 @@ class ClickHouseWriter:
         finally:
             self.client = None
             self.enabled = False
+            self._is_alive = False
 
 
 class PipelineManager:
@@ -960,6 +996,11 @@ class PipelineManager:
             ("kafka", "handler_error"),
         ):
             PIPELINE_METRICS.dead_letter_total.labels(source=source, reason=reason)
+        # health probe check 
+        self.probe_interval_sec = 15
+        self.probe_timeout_sec = 3
+        self._probe_task: Optional[asyncio.Task] = None
+        self._last_probe_at: Optional[datetime] = None
 
     async def initialize(self) -> None:
         if not self.enabled:
@@ -978,26 +1019,44 @@ class PipelineManager:
             self.logger.info("PipelineManager initialized")
         else:
             self.logger.info("Pipeline skipped: Kafka/ClickHouse not available")
+        self._last_probe_at = datetime.now(timezone.utc)
+        self._probe_task = asyncio.create_task(self._probe_loop())
+
+    async def _probe_loop(self) -> None:
+        """Refresh Kafka/ClickHouse _is_alive every probe_interval_sec."""
+        while True:
+            await asyncio.sleep(self.probe_interval_sec)
+            try:
+                await asyncio.gather(
+                    self.producer.probe(self.probe_timeout_sec),
+                    self.ch_writer.probe(self.probe_timeout_sec))
+                self._last_probe_at = datetime.now(timezone.utc)
+            except Exception as e:
+                self.logger.error("Pipeline health probe failed: %s", e)
 
     async def get_health_status(self) -> HealthStatus:
-
-        kafka_ok = self.producer.enabled
-        ch_ok = self.ch_writer.enabled
+        """Read probe results from memory only; no network IO on /health."""
+        kafka_ok = self.producer._is_alive
+        ch_ok = self.ch_writer._is_alive
 
         if not self.enabled:
             status, message = "healthy", "pipeline disabled"
         elif kafka_ok and ch_ok:
-            status, message = "healthy", "kafka and clickhouse both enabled"
+            status, message = "healthy", "kafka and clickhouse reachable"
         else:
             status = "degraded"
             message = (f"pipeline.enabled=True but "
-                       f"kafka={kafka_ok}, clickhouse={ch_ok}")
+                       f"kafka_alive={kafka_ok}, clickhouse_alive={ch_ok}")
         return HealthStatus(
             service_name="pipeline",
             status=status,
             message=message,
             last_check_at=datetime.now(timezone.utc),
-            metadata={"kafka_ok": kafka_ok, "clickhouse_ok": ch_ok},
+            metadata={
+                "kafka_ok": kafka_ok, "clickhouse_ok": ch_ok,
+                "last_probe_at": self._last_probe_at,
+                "probe_interval_sec": self.probe_interval_sec,
+            },
         )
 
     async def start_consumer(self) -> None:
@@ -1077,6 +1136,13 @@ class PipelineManager:
 
     async def shutdown(self) -> None:
         """Close all three components; main runs stop_consumer and flush_all first."""
+        if self._probe_task is not None:
+            self._probe_task.cancel()
+            try:
+                await self._probe_task
+            except asyncio.CancelledError:
+                pass
+            self._probe_task = None
         await self.producer.shutdown()
         await self.consumer.stop()      # no-op once stop_consumer() has run
         await self.ch_writer.shutdown()

@@ -222,17 +222,27 @@ class ResponseCache:
             logger.warning("Redis initialization failed; cache disabled: %s", exc)
 
     async def get_health_status(self) -> HealthStatus:
+        """Live Redis PING with a 0.5s timeout; cheap enough to run per /health."""
         now = datetime.now(timezone.utc)
-        if not self.enabled or self.redis_client is None:
+        # self.enabled flips to False when initialize() fails, so the config
+        # switch is read separately: configured-but-unreachable is degraded.
+        if not self.config.get("enabled", False):
             return HealthStatus(
                 service_name="cache", status="healthy", message="cache disabled",
-                last_check_at=now, metadata={"enabled": self.enabled},
+                last_check_at=now, metadata={"enabled": False},
             )
-        try:
-            await asyncio.wait_for(self.redis_client.ping(), timeout=0.5)
-            status, message = "healthy", "redis ping OK"
-        except Exception as exc:
-            status, message = "degraded", f"redis unreachable: {exc}"
+        if self.redis_client is None:
+            status, message = "degraded", "cache enabled but redis client not created"
+        else:
+            try:
+                await asyncio.wait_for(self.redis_client.ping(), timeout=0.5)
+                # Reachable now, but initialize() failed so the cache stays off.
+                if self.enabled:
+                    status, message = "healthy", "redis ping OK"
+                else:
+                    status, message = "degraded", "redis reachable but cache disabled after init failure"
+            except Exception as exc:
+                status, message = "degraded", f"redis unreachable: {type(exc).__name__}: {exc}"
         return HealthStatus(
             service_name="cache", status=status, message=message,
             last_check_at=now, metadata={"enabled": self.enabled, "ttl": self.ttl},

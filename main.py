@@ -155,6 +155,7 @@ class LLMRouterPlatform:
             self.logger.info("Initializing PipelineManager...")
             # pipeline.enabled=False leaves the P2 router object untouched.
             router.route_query = _capture_routing_decision(router.route_query)
+            pipeline = None
             try:
                 from src.llm_router_part3_pipeline import PipelineManager
                 pipeline = PipelineManager(self.config)
@@ -163,6 +164,11 @@ class LLMRouterPlatform:
                 self.services["pipeline"] = pipeline
             except Exception as exc:
                 self.logger.warning("Pipeline initialization skipped: %s", exc)
+                if pipeline is not None:
+                    try:
+                        await pipeline.shutdown()
+                    except Exception as close_exc:
+                        self.logger.warning("Pipeline cleanup failed: %s", close_exc)
         else:
             self.logger.info("Pipeline disabled by config")
 
@@ -376,8 +382,8 @@ class LLMRouterPlatform:
             if pipeline is not None:
                 pipeline_block = {
                     "enabled": pipeline.enabled,
-                    "kafka_ok": pipeline.producer.enabled,
-                    "clickhouse_ok": pipeline.ch_writer.enabled,
+                    "kafka_ok": pipeline.producer._is_alive,
+                    "clickhouse_ok": pipeline.ch_writer._is_alive,
                 }
             else:
                 pipeline_block = {

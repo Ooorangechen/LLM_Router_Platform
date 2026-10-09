@@ -89,6 +89,7 @@ class SystemResourceCollector:
     async def start(self) -> None:
         self._running = True
         self._task = asyncio.create_task(self._collect_loop())
+        self.logger.info("SystemResourceCollector started (interval=%ss)", self.interval_sec)
 
     async def _collect_loop(self) -> None:
         while self._running:

@@ -8,13 +8,27 @@ cd "$(dirname "$0")/.."
 # If you change docker run flags below, remove the container once by hand: docker rm -f <name>
 
 #    PROMETHEUS (9090)
+# monitoring/prometheus.yml keeps localhost targets for a bare-metal Prometheus.
+# Inside the container localhost is the container itself, so generate a copy
+# whose scrape targets point at the host. Only the scrape_configs section is
+# rewritten: prometheus-self (localhost:9090) scrapes the container itself, and
+# the alerting target (localhost:9093) is left as-is since no Alertmanager runs.
+# Regenerated on every run so template edits reach the reused container too.
+sed -e '/^scrape_configs:/,$ {' \
+    -e '/localhost:9090/!s/localhost:/host.docker.internal:/' \
+    -e '}' \
+    monitoring/prometheus.yml > monitoring/prometheus.docker.yml
+
 mkdir -p data/prometheus
+# host-gateway makes host.docker.internal resolve on Linux Docker too
+# (Docker Desktop on Mac/Windows already provides it).
 docker start prom-p4 2>/dev/null || \
 docker run -d --name prom-p4 -p 9090:9090 \
+  --add-host=host.docker.internal:host-gateway \
   -v $(pwd)/monitoring:/etc/prometheus:ro \
   -v $(pwd)/data/prometheus:/prometheus \
   prom/prometheus:v2.48.0 \
-  --config.file=/etc/prometheus/prometheus.yml \
+  --config.file=/etc/prometheus/prometheus.docker.yml \
   --storage.tsdb.path=/prometheus \
   --web.enable-lifecycle
 
@@ -34,12 +48,14 @@ docker run -d --name ne-p4 -p 9100:9100 \
 #    KAFKA EXPORTER (9308)
 docker start kafka-exp-p4 2>/dev/null || \
 docker run -d --name kafka-exp-p4 -p 9308:9308 \
+  --add-host=host.docker.internal:host-gateway \
   danielqsj/kafka-exporter:v1.7.0 \
   --kafka.server=host.docker.internal:9092
 
 #    CLICKHOUSE EXPORTER (9116)
 docker start ch-exp-p4 2>/dev/null || \
 docker run -d --name ch-exp-p4 -p 9116:9116 \
+  --add-host=host.docker.internal:host-gateway \
   f1yegor/clickhouse-exporter \
   -scrape_uri=http://host.docker.internal:8123/
 

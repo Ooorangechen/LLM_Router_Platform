@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from datetime import datetime, timedelta, timezone
-from src.llm_router_part5_schema import PolicyResult, RequestState
+from src.llm_router_part5_langgraph import PolicyResult, RequestState
 from src.utils.logger import get_logger
 from src.utils.metrics import POLICY_METRICS
 
@@ -445,6 +445,8 @@ class ExecutionPolicy:
         tier = self._tier_config(tier_key)
         label = tier_key.lower()
         user_id = state.input.user_id
+        daily_total = int(tier["daily_quota"])
+        hourly_total = int(tier["hourly_quota"])
         sla_target_ms = int(tier["sla_target_ms"])
         cost_budget_usd = float(tier["cost_budget_usd"])
         POLICY_METRICS.quota_checked_total.labels(user_tier=label).inc()
@@ -455,11 +457,12 @@ class ExecutionPolicy:
             used_h = await self.quota_store.incr_hourly(user_id, tier_key, hour_str, 0)
         except Exception as exc:
             logger.warning("Quota store error in check, allowing request: %s", exc)
-            return PolicyResult(passed=True, sla_target_ms=sla_target_ms, cost_budget_usd=cost_budget_usd,
+            return PolicyResult(passed=True, daily_quota_total=daily_total, hourly_quota_total=hourly_total,
+                                sla_target_ms=sla_target_ms, cost_budget_usd=cost_budget_usd,
                                 message=f"policy_error: quota store unavailable ({type(exc).__name__})")
 
-        daily_remaining = max(0, int(tier["daily_quota"]) - used_d)
-        hourly_remaining = max(0, int(tier["hourly_quota"]) - used_h)
+        daily_remaining = max(0, daily_total - used_d)
+        hourly_remaining = max(0, hourly_total - used_h)
 
         break_reason, metric_reason = None, None
         if daily_remaining <= 0:
@@ -477,6 +480,8 @@ class ExecutionPolicy:
         return PolicyResult(
             passed=break_reason is None,
             break_reason=break_reason,
+            daily_quota_total=daily_total,
+            hourly_quota_total=hourly_total,
             daily_remaining_before=daily_remaining,
             daily_remaining_after=daily_remaining,
             hourly_remaining_before=hourly_remaining,

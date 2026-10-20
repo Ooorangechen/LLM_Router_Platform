@@ -376,36 +376,34 @@ adapters:
     epochs: 3
     batch_size: 8
 
-policies: 
-  quota:
-    tier_quotas:
-      free: 
-        daily: 100
-        hourly: 10
-      premium:
-        daily: 1000
-        hourly: 100
-      enterprise:
-        daily: 10000
-        hourly: 1000
-
-  sla:
-    latency_sla_seconds:
-      free: 10.0
-      premium: 5.0
-      enterprise: 2.0
-  
-  budget: 
-    cost_budgets:
-      free: 0.01
-      premium: 0.10
-      enterprise: 1.00
-  
-  circuit_breaker: 
-    enabled: false
+policy:
+  enabled: false
+  backend: memory                 # memory | redis
+  redis:                          # used when backend=redis
+    host: localhost
+    port: 6379
+    db: 1
+    key_prefix: "llm-router:policy:"
+    timeout_sec: 2
+  tiers:                          # overrides default tier table, missing fields padded with defaults
+    FREE:       { daily_quota: 100,   hourly_quota: 10,   sla_target_ms: 10000, cost_budget_usd: 0.01 }
+    PREMIUM:    { daily_quota: 1000,  hourly_quota: 100,  sla_target_ms: 5000,  cost_budget_usd: 0.10 }
+    ENTERPRISE: { daily_quota: 10000, hourly_quota: 1000, sla_target_ms: 2000,  cost_budget_usd: 1.00 }
+  circuit_breaker:
+    enabled: true
     failure_threshold: 5
-    recovery_timeout_seconds: 30
-  
+    half_open_after_sec: 30
+    per_model: true               # independent CB per model
+    global_fallback: true         # whether to immediately downgrade to default_model or 429 upon global tripping
+  snapshot:
+    enabled: true
+    file: data/policy_state/snapshot.json
+    flush_interval_sec: 60
+  cost_budget:
+    enabled: true                 # reject directly if estimated cost exceeds budget
+    estimated_only: true          # check using estimated_cost from router phase only, without executing inference
+  refund_on_failure: true         # automatically refund quota on execute failure
+
 optimization:
   enabled: false
   kv_cache_size_gb: 8

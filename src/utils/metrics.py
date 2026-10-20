@@ -364,6 +364,45 @@ class HealthMetrics:
         )
 
 
+class PolicyMetrics:
+    """P5 ExecutionPolicy metrics: quota / budget / circuit breaker"""
+    def __init__(self):
+        self.quota_checked_total = Counter(
+            "llm_router_policy_quota_checked_total",
+            "total quota checks",
+            labelnames=["user_tier"]
+        )
+        self.quota_consumed_total = Counter(
+            "llm_router_policy_quota_consumed_total",
+            "total quota consumed",
+            labelnames=["user_tier"]
+        )
+        self.quota_refunded_total = Counter(
+            "llm_router_policy_quota_refunded_total",
+            "total quota refunded",
+            labelnames=["user_tier", "reason"]
+        )
+        # reason: daily | hourly | budget
+        self.quota_rejected_total = Counter(
+            "llm_router_policy_quota_rejected_total",
+            "total requests rejected by policy",
+            labelnames=["user_tier", "reason"]
+        )
+
+        # Gauge instead of Info. Set the current state's series to 1 and the
+        # other two to 0, so Grafana / alert rules can filter with state="OPEN" == 1.
+        self.circuit_breaker_state_info = Gauge(
+            "llm_router_policy_circuit_breaker_state_info",
+            "circuit breaker state, 1 for the current state",
+            labelnames=["name", "state"]
+        )
+        self.circuit_breaker_opened_total = Counter(
+            "llm_router_policy_circuit_breaker_opened_total",
+            "total circuit breaker CLOSED/HALF_OPEN -> OPEN transitions",
+            labelnames=["name"]
+        )
+
+
 
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
@@ -374,6 +413,9 @@ PIPELINE_METRICS = PipelineMetrics()
 RESOURCE_METRICS = ResourceMetrics()
 HEALTH_METRICS = HealthMetrics()
 ALERT_METRICS = AlertMetrics()
+
+# P5 added, execution policy
+POLICY_METRICS = PolicyMetrics()
 
 # create once, then prometheus will register to the global.
 # load once at creation, then all the other modules share the same default registry

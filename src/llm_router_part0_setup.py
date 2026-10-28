@@ -32,6 +32,8 @@ REQUIRED_DIRS = [
     "data/prometheus",
     "data/grafana",
     "data/processed/routed",
+    "data/feedback",        # P5 D9: feedback JSONL
+    "data/policy_state",    # P5 D9: quota snapshot
     "docker",
     ".github/workflows",
     "flink",
@@ -62,8 +64,8 @@ KEY_FILES = [
 EXPECTED_SECTIONS = [
     "api", "logging", "router", "inference", "kafka", "clickhouse",
     "monitoring", "slack", "streamlit", "flink", "security", "performance",
-    "development", "features", "pipeline", "adapters", "policies",
-    "optimization", "quality", "router_mode",
+    "development", "features", "pipeline", "adapters", "policy", "langgraph",
+    "optimization", "quality", "feedback", "router_mode",
 ]
 
 
@@ -525,35 +527,47 @@ adapters:
     epochs: 3
     batch_size: 8
 
-policies:
-  quota:
-    tier_quotas:
-      free:
-        daily: 100
-        hourly: 10
-      premium:
-        daily: 1000
-        hourly: 100
-      enterprise:
-        daily: 10000
-        hourly: 1000
-
-  sla:
-    latency_sla_seconds:
-      free: 10.0
-      premium: 5.0
-      enterprise: 2.0
-
-  budget:
-    cost_budgets:
-      free: 0.01
-      premium: 0.10
-      enterprise: 1.00
-
+policy:
+  enabled: false
+  backend: memory                 # memory | redis
+  redis:                          # used when backend=redis
+    host: localhost
+    port: 6379
+    db: 1
+    key_prefix: "llm-router:policy:"
+    timeout_sec: 2
+  tiers:                          # overrides default tier table, missing fields padded with defaults
+    FREE:       { daily_quota: 100,   hourly_quota: 10,   sla_target_ms: 10000, cost_budget_usd: 0.01 }
+    PREMIUM:    { daily_quota: 1000,  hourly_quota: 100,  sla_target_ms: 5000,  cost_budget_usd: 0.10 }
+    ENTERPRISE: { daily_quota: 10000, hourly_quota: 1000, sla_target_ms: 2000,  cost_budget_usd: 1.00 }
   circuit_breaker:
-    enabled: false
+    enabled: true
     failure_threshold: 5
-    recovery_timeout_seconds: 30
+    half_open_after_sec: 30
+    per_model: true               # independent CB per model
+    global_fallback: true         # whether to immediately downgrade to default_model or 429 upon global tripping
+  snapshot:
+    enabled: true
+    file: data/policy_state/snapshot.json
+    flush_interval_sec: 60
+  cost_budget:
+    enabled: true                 # reject directly if estimated cost exceeds budget
+    estimated_only: true          # check using estimated_cost from router phase only, without executing inference
+  refund_on_failure: true         # automatically refund quota on execute failure
+
+langgraph:
+  enabled: false                 # P5 master switch
+  use_simple_graph_fallback: true  # simple compatibility layer when langgraph package is missing
+  integrated_mode: true          # if enabled, POST /route can also internally switch to LangGraph (P5 optional, default disabled to keep P2 pass-through)
+  execution_path_audit: true     # every node must append
+  force_log_node_always: true    # force log route even on exceptions
+  nodes:
+    classify_enabled: true
+    compress_enabled: true
+    select_adapter_enabled: true # P5 placeholder, but execution path still displays it
+    fallback_enabled: true
+    max_node_retries: 1          # single node exception retry count
+  timeout_sec: 60                # ainvoke total timeout
 
 optimization:
   enabled: false
@@ -564,20 +578,29 @@ optimization:
   tensorrt: false
 
 quality:
-  monitor:
-    enabled: false
-    window_size: 100
-    window_duration_seconds: 3600
+  enabled: false
+  rolling_window_minutes: 5
+  rolling_window_max_records: 10000
+  cache_ttl_sec: 10
+  slo:
+    error_rate_threshold: 0.05
+    latency_p95_threshold_ms: 3000
+  hotspot:
+    min_samples: 10
+    avg_latency_threshold_ms: 5000
+  report_to_alert_manager: true   # active alerting via P4 AlertManager on SLO violations
+  alert_severity: warning
 
-  slo_targets:
-    availability: 0.999
-    latency_p95_seconds: 2.0
-    error_rate_max: 0.01
-
-  feedback:
-    storage_path: data/feedback
-
-  health_check_interval_seconds: 30
+feedback:
+  enabled: false
+  storage_path: data/feedback/feedback.jsonl
+  lock_timeout_sec: 10
+  comment_max_length: 2000
+  allow_anonymous: true           # fill with anonymous when user_id is empty
+  dashboard:
+    default_window_minutes: 60
+    default_limit: 20
+    join_clickhouse_model: true   # if enabled, populate model in dashboard interface
 
 router_mode:
   use_integrated_router: false
@@ -790,6 +813,7 @@ logs/
 data/queries/
 data/processed/
 data/feedback/
+data/policy_state/
 data/prometheus/
 data/grafana/
 

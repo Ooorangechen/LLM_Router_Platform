@@ -1,18 +1,16 @@
 import asyncio
 import json
-from pydantic import AfterValidator, AwareDatetime, BaseModel, Field
 from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypedDict
 from datetime import datetime, timezone
 from time import perf_counter
-from uuid import UUID
-from src.utils.schema import InferenceResponse, QueryRequest, RoutingDecision, UserTier
+from src.utils.schema import InferenceResponse, QueryRequest, RoutingDecision
 from src.utils.logger import get_logger
 from src.utils.metrics import INFERENCE_METRICS
+from src.llm_router_part5_schema import AdvancedRouteResponse, InputState, PolicyResult, RequestState
 
 if TYPE_CHECKING:
-    # 只用于类型标注，运行时不 import：
-    # - policy 模块在运行时 import 本模块的 RequestState / PolicyResult，这里再运行时 import 它会循环；
-    # - router / inference 由构造函数注入（文档 3.3 D），本模块不依赖 P1/P2 模块本身。
+    # 只用于类型标注，运行时不 import：依赖都由构造函数注入（文档 3.3 D），
+    # 本模块不依赖 P1/P2 模块、policy、quality 模块本身。
     from src.llm_router_part1_router import ModelRouter
     from src.llm_router_part2_inference import InferenceEngine
     from src.llm_router_part5_policy import ExecutionPolicy
@@ -27,144 +25,6 @@ except ImportError:
     LANGGRAPH_AVAILABLE = False
     StateGraph = None
     START, END = "__start__", "__end__"
-
-def _to_utc(v: datetime) -> datetime:
-    return v.astimezone(timezone.utc)
-
-
-class InputState(BaseModel):
-    request_id: UUID
-    user_id: str
-    user_tier: UserTier
-    tenant_id: Optional[str] = None
-    domain: Optional[str] = None
-    query_text: str
-    context_text: Optional[str] = None
-    attachments_count: int
-    temperature: float
-    max_tokens: int
-    # Decision: naive datetimes are rejected rather than guessed (P2 timestamps are naive local time);
-    # aware ones are normalized to UTC (3.1 core constraint).
-    received_at: Annotated[AwareDatetime, AfterValidator(_to_utc)] = Field(
-        default_factory=lambda: datetime.now(timezone.utc))
-
-class RoutingState(BaseModel):
-    query_type: Optional[str] = None
-    query_type_confidence: Optional[float] = None
-    selected_model: Optional[str] = None
-    selected_provider: Optional[str] = None
-    routing_strategy: Optional[str] = None
-    routing_reason: Optional[str] = None
-    adapter_name: Optional[str] = None
-    routing_time_ms: Optional[int] = None
-
-class PolicyState(BaseModel):
-    policy_applied: bool = False
-    policy_check_passed: Optional[bool] = None
-    daily_quota_total: Optional[int] = None
-    daily_quota_remaining_before: Optional[int] = None
-    daily_quota_remaining_after: Optional[int] = None
-    hourly_quota_total: Optional[int] = None
-    hourly_quota_remaining_before: Optional[int] = None
-    hourly_quota_remaining_after: Optional[int] = None
-    sla_target_ms: Optional[int] = None
-    cost_budget_usd: Optional[float] = None
-    cost_consumed_usd: Optional[float] = None
-    use_cache: Optional[bool] = None
-    batch_id: Optional[str] = None
-    break_reason: Optional[str] = None
-    policy_error: Optional[str] = None
-
-class ResultState(BaseModel):
-    success: Optional[bool] = None
-    response_text: Optional[str] = None
-    token_count_input: Optional[int] = None
-    token_count_output: Optional[int] = None
-    total_tokens: Optional[int] = None
-    latency_ms: Optional[int] = None
-    cost_usd: Optional[float] = None
-    cached_response: Optional[bool] = None
-    compressed_context: Optional[bool] = None
-    provider: Optional[str] = None
-    error_type: Optional[str] = None
-    error_message: Optional[str] = None
-    fallback_used: bool = False
-    fallback_model: Optional[str] = None
-
-class MetadataState(BaseModel):
-    execution_path: List[str] = []
-    circuit_breaker_state: Optional[str] = None # in CLOSED, OPEN, HALF_OPEN
-    node_started_at: Dict[str, datetime] = {}
-    node_finished_at: Dict[str, datetime] = {}
-    node_errors: Dict[str, str] = {}
-    total_elapsed_ms: Optional[int] = None
-    server_version: str = "P5-v1.0"
-    extra: Dict[str, Any] = {}
-
-class PolicyResult(BaseModel):
-    passed: bool
-    break_reason: Optional[str] = None
-    # Decision: 文档的 PolicyResult 没有总量字段，加上后 policy_check 节点可以直接回填 PolicyState 的两个 *_total
-    daily_quota_total: Optional[int] = None
-    hourly_quota_total: Optional[int] = None
-    daily_remaining_before: Optional[int] = None
-    daily_remaining_after: Optional[int] = None
-    hourly_remaining_before: Optional[int] = None
-    hourly_remaining_after: Optional[int] = None
-    sla_target_ms: Optional[int] = None
-    cost_budget_usd: Optional[float] = None
-    message: str
-
-class QualitySnapshot(BaseModel):
-    window_minutes: int
-    request_count: int
-    success_rate: float
-    error_rate: float
-    avg_latency_ms: float
-    p50_latency_ms: float
-    p95_latency_ms: float
-    p99_latency_ms: float
-    total_tokens: int
-    total_cost_usd: float
-    slo_ok: bool
-    slo_violations: List[str]
-    hotspot_models: List[str]
-    snapshot_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class RequestState(BaseModel):
-    input: InputState
-    routing: RoutingState = Field(default_factory=RoutingState)
-    policy: PolicyState = Field(default_factory=PolicyState)
-    result: ResultState = Field(default_factory=ResultState)
-    metadata: MetadataState = Field(default_factory=MetadataState)
-
-    def append_execution_step(self, node_name: str) -> None:
-        path = self.metadata.execution_path
-        if not path or path[-1] != node_name:
-            path.append(node_name)
-
-    # no tz normalization here. Callers pass datetime.now(timezone.utc),
-    # and dict item assignment would bypass pydantic validators anyway.
-    def mark_node_start(self, node: str, t: datetime) -> None:
-        self.metadata.node_started_at[node] = t
-
-    def mark_node_end(self, node: str, t: datetime) -> None:
-        self.metadata.node_finished_at[node] = t
-
-    def to_audit_log(self) -> Dict[str, Any]:
-        return {
-            "input": self.input.model_dump(mode="json"),
-            "policy": self.policy.model_dump(mode="json", include={
-                "daily_quota_remaining_before",
-                "daily_quota_remaining_after",
-                "hourly_quota_remaining_before",
-                "hourly_quota_remaining_after",
-            }),
-            "result": self.result.model_dump(mode="json", include={
-                "success", "latency_ms", "cost_usd"}),
-            "execution_path": list(self.metadata.execution_path),
-        }
-
 
 ################# Task 3.3: LangGraph State Graph Orchestration #################
 
@@ -500,7 +360,7 @@ class LangGraphRouterOrchestrator:
                 raise PolicyRejectedError(consumed.break_reason, updates)
 
         model_name = state["routing"].get("selected_model") or self.router.default_model
-        return await self._attempt(state, model_name, updates)
+        return await self._attempt(state, model_name, updates, ("routing", "selected_model"))
 
     async def fallback_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         if state["result"].get("fallback_used"):
@@ -510,7 +370,7 @@ class LangGraphRouterOrchestrator:
         fallback_model = fallback_models[0] if fallback_models else self.router.default_model
         # no consume here: the quota was taken once by execute
         marker = {"result": {"fallback_used": True, "fallback_model": fallback_model}}
-        return await self._attempt(state, fallback_model, marker)
+        return await self._attempt(state, fallback_model, marker, ("result", "fallback_model"))
 
     async def log_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
         state_obj = RequestState.model_validate(state)
@@ -518,7 +378,10 @@ class LangGraphRouterOrchestrator:
             # Decision: refund here, not in execute (3.3 B step 6): a fallback success must stay charged (M2).
             # refund() is a no-op when nothing was consumed.
             reason = BREAK_CIRCUIT_OPEN if state_obj.policy.break_reason == BREAK_CIRCUIT_OPEN else "execution_failure"
-            await self.policy.refund(state_obj, reason=reason)
+            if await self.policy.refund(state_obj, reason=reason):
+                # report the counts after the refund, i.e. back to what they were before consume()
+                state_obj.policy.daily_quota_remaining_after = state_obj.policy.daily_quota_remaining_before
+                state_obj.policy.hourly_quota_remaining_after = state_obj.policy.hourly_quota_remaining_before
 
         received_at = state_obj.input.received_at
         state_obj.metadata.total_elapsed_ms = int((datetime.now(timezone.utc) - received_at).total_seconds() * 1000)
@@ -528,19 +391,27 @@ class LangGraphRouterOrchestrator:
         if self._quality_enabled:
             self.quality_monitor.end_request(state_obj)
         self._publish_pipeline_events(state_obj)
-        return {"metadata": {"extra": state_obj.metadata.extra,
+        return {"policy": {"daily_quota_remaining_after": state_obj.policy.daily_quota_remaining_after,
+                           "hourly_quota_remaining_after": state_obj.policy.hourly_quota_remaining_after},
+                "metadata": {"extra": state_obj.metadata.extra,
                              "total_elapsed_ms": state_obj.metadata.total_elapsed_ms}}
 
     ######## execution helpers (execute + fallback) ########
 
-    async def _attempt(self, state: Dict[str, Any], model_name: str, updates: Dict[str, Any]) -> Dict[str, Any]:
-        """Breaker gate -> generate -> breaker report; `updates` is merged into the returned update."""
+    async def _attempt(self, state: Dict[str, Any], model_name: str, updates: Dict[str, Any],
+                       model_field: Tuple[str, str]) -> Dict[str, Any]:
+        """Breaker gate -> generate -> breaker report; `updates` is merged into the returned update.
+        `model_field` (partition, key) receives the model that actually ran."""
         circuits = self._circuits_for(model_name) if self._policy_enabled else []
+        acquired = []
         for cb in circuits:
             if not await cb.acquire():
+                for taken in acquired:
+                    await taken.release()  # the call never ran: hand back any HALF_OPEN probe slot
                 # circuits[-1] is the global breaker, which AdvancedRouteResponse reports (3.4 A)
                 raise CircuitOpenError(cb.name, _apply_update(
                     updates, {"metadata": {"circuit_breaker_state": circuits[-1].state}}))
+            acquired.append(cb)
 
         response, error_type = await self._generate(state, model_name)
         failed = bool(response.error)
@@ -567,6 +438,10 @@ class LangGraphRouterOrchestrator:
             # kept for the P3 pipeline publish in log; fallback overwrites execute's response
             "metadata": {"extra": {**extra, "inference_response": response.model_dump()}},
         }
+        # _resolve_available_model may swap in another model (e.g. vLLM down); report the one that ran.
+        # Breakers stay keyed by the requested model, which is what acquire() was called on.
+        partition, key = model_field
+        more.setdefault(partition, {})[key] = response.model_name
         for cb in circuits:
             await (cb.record_failure() if failed else cb.record_success())
         if circuits:
@@ -630,7 +505,7 @@ class LangGraphRouterOrchestrator:
 
     def _circuits_for(self, model_name: str) -> List[Any]:
         # Decision: gate on global + per-model breakers; without an acquire() the global one could never leave OPEN.
-        # Model first: a refusal there must not use up the global breaker's single HALF_OPEN probe.
+        # A refusal by one releases the probe slot taken by the other (see _attempt).
         # With per_model=false both lookups return the same global breaker.
         global_cb = self.policy.circuit_breaker_for("global")
         model_cb = self.policy.circuit_breaker_for(model_name)
@@ -693,8 +568,8 @@ class IntegratedLLMRouter:
         self.orchestrator = orchestrator
         self.quality_monitor = quality_monitor
 
-    async def process_query_advanced(self, request: QueryRequest) -> Dict[str, Any]:
-        # Decision: returns a dict keyed like AdvancedRouteResponse; 3.4 adds the Pydantic model and wraps it.
+    async def process_query_advanced(self, request: QueryRequest,
+                                     received_at: Optional[datetime] = None) -> AdvancedRouteResponse:
         state = RequestState(input=InputState(
             request_id=request.request_id,
             user_id=request.user_id,
@@ -704,6 +579,7 @@ class IntegratedLLMRouter:
             attachments_count=len(request.attachments),
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            received_at=received_at or datetime.now(timezone.utc),
         ))
         state.append_execution_step(PATH_START)
         if self.quality_monitor is not None:
@@ -713,34 +589,34 @@ class IntegratedLLMRouter:
         inp, policy, result, meta = state.input, state.policy, state.result, state.metadata
         # Decision: -1 marks "unknown" (policy disabled) in quota_remaining, distinct from 0 remaining.
         unknown = -1
-        return {
-            "query_id": str(inp.request_id),
-            "user_id": inp.user_id,
-            "success": result.success is True,
-            "response": result.response_text if result.success else None,
-            "model_name": result.fallback_model if result.fallback_used else state.routing.selected_model,
-            "provider": result.provider,
-            "tokens": {
+        return AdvancedRouteResponse(
+            query_id=inp.request_id,
+            user_id=inp.user_id,
+            success=result.success is True,
+            response=result.response_text if result.success else None,
+            model_name=result.fallback_model if result.fallback_used else state.routing.selected_model,
+            provider=result.provider,
+            tokens={
                 "input": result.token_count_input,
                 "output": result.token_count_output,
                 "total": result.total_tokens,
             },
-            "cost_usd": result.cost_usd,
-            "latency_ms": result.latency_ms,
-            "cached": result.cached_response,
-            "compressed_context": result.compressed_context,
-            "execution_path": meta.execution_path,
-            "policy_applied": policy.policy_applied,
-            "policy_rejected": policy.policy_check_passed is False,
-            "break_reason": policy.break_reason,
-            "quota_remaining": {
+            cost_usd=result.cost_usd,
+            latency_ms=result.latency_ms,
+            cached=result.cached_response,
+            compressed_context=result.compressed_context,
+            execution_path=meta.execution_path,
+            policy_applied=policy.policy_applied,
+            policy_rejected=policy.policy_check_passed is False,
+            break_reason=policy.break_reason,
+            quota_remaining={
                 "daily": policy.daily_quota_remaining_after if policy.daily_quota_remaining_after is not None else unknown,
                 "hourly": policy.hourly_quota_remaining_after if policy.hourly_quota_remaining_after is not None else unknown,
                 "sla_target_ms": policy.sla_target_ms if policy.sla_target_ms is not None else unknown,
                 "cost_budget_usd": policy.cost_budget_usd if policy.cost_budget_usd is not None else float(unknown),
             },
-            "circuit_breaker_state": meta.circuit_breaker_state,
-            "error": result.error_message,
-            "fallback_used": result.fallback_used,
-            "total_elapsed_ms": meta.total_elapsed_ms or 0,
-        }
+            circuit_breaker_state=meta.circuit_breaker_state,
+            error=result.error_message,
+            fallback_used=result.fallback_used,
+            total_elapsed_ms=meta.total_elapsed_ms or 0,
+        )

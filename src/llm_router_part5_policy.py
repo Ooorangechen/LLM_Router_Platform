@@ -3,9 +3,9 @@ import json
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
-from src.llm_router_part5_langgraph import PolicyResult, RequestState
+from src.llm_router_part5_schema import PolicyResult, RequestState
 from src.utils.logger import get_logger
 from src.utils.metrics import POLICY_METRICS
 
@@ -330,6 +330,14 @@ class CircuitBreaker:
                     self.last_failure_at = now
                     self._transition(CB_OPEN)
 
+    async def release(self) -> None:
+        """Give back a HALF_OPEN probe slot taken by acquire() when the call never ran.
+        Decision: not in the 3.2 doc; needed when a request passes one breaker but another
+        refuses it, otherwise the probe slot stays taken for half_open_after seconds."""
+        async with self._lock:
+            if self.state == CB_HALF_OPEN:
+                self._probe_started_at = None
+
     def get_status(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -545,14 +553,16 @@ class ExecutionPolicy:
             "message": "consumed",
         })
 
-    async def refund(self, state: RequestState, reason: str = "execution_failure") -> None:
+    async def refund(self, state: RequestState, reason: str = "execution_failure") -> bool:
+        # Decision: returns whether quota was given back (doc gives no return type), so the caller
+        # can report the refunded remaining counts instead of the consumed ones.
         if not self._refund_on_failure:
-            return
-        
+            return False
+
         date_str = state.metadata.extra.pop("policy_date_key", None)
         hour_str = state.metadata.extra.pop("policy_hour_key", None)
         if date_str is None or hour_str is None:
-            return
+            return False
 
         tier_key = self._tier_key(state.input.user_tier)
         user_id = state.input.user_id
@@ -561,8 +571,9 @@ class ExecutionPolicy:
             await self.quota_store.incr_hourly(user_id, tier_key, hour_str, -1)
         except Exception as exc:
             logger.warning("Quota refund failed for %s: %s", user_id, exc)
-            return
+            return False
         POLICY_METRICS.quota_refunded_total.labels(user_tier=tier_key.lower(), reason=reason).inc()
+        return True
 
     def circuit_breaker_for(self, key: str = "global") -> CircuitBreaker:
         if not self._cb_per_model:
@@ -572,3 +583,28 @@ class ExecutionPolicy:
             cb = CircuitBreaker(key, self._cb_threshold, self._cb_half_open_after)
             self._cb_registry[key] = cb
         return cb
+
+    ######## read-only views for /admin/policy/* (3.4 C) ########
+
+    def get_tiers(self) -> Dict[str, Dict]:
+        return {name: self._tier_config(name) for name in self.default_tiers}
+
+    async def get_user_quota(self, user_id: str, tier: Any) -> Dict[str, Any]:
+        """Remaining quota without consuming; same arithmetic as check()."""
+        tier_key = self._tier_key(tier)
+        cfg = self._tier_config(tier_key)
+        date_str, hour_str = self._time_keys()
+        used_d = await self.quota_store.get_daily_quota(user_id, tier_key, date_str)
+        used_h = await self.quota_store.get_hourly_quota(user_id, tier_key, hour_str)
+        return {
+            "user_id": user_id,
+            "tier": tier_key,
+            "daily_remaining": max(0, int(cfg["daily_quota"]) - used_d),
+            "hourly_remaining": max(0, int(cfg["hourly_quota"]) - used_h),
+            "sla_target_ms": int(cfg["sla_target_ms"]),
+            "cost_budget_usd": float(cfg["cost_budget_usd"]),
+        }
+
+    def circuit_breaker_status(self, name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Every registered breaker, or only `name`; never creates one."""
+        return [cb.get_status() for key, cb in self._cb_registry.items() if name is None or key == name]

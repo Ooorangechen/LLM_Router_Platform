@@ -403,6 +403,50 @@ class PolicyMetrics:
         )
 
 
+class QualityMetrics:
+    """P5 QualityMonitor metrics: per-request quality, SLO violations, hotspots"""
+    def __init__(self):
+        self.requests_total = Counter(
+            "llm_router_quality_requests_total",
+            "requests recorded by the quality monitor",
+            labelnames=["model", "user_tier", "status"]
+        )
+        self.request_duration_seconds = Histogram(
+            "llm_router_quality_request_duration_seconds",
+            "model latency of requests recorded by the quality monitor",
+            labelnames=["model", "user_tier"],
+            buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, float("inf")]
+        )
+        self.tokens_total = Counter(
+            "llm_router_quality_tokens_total",
+            "tokens of requests recorded by the quality monitor",
+            labelnames=["model"]
+        )
+        self.cost_usd_total = Counter(
+            "llm_router_quality_cost_usd_total",
+            "cost in usd of requests recorded by the quality monitor",
+            labelnames=["model"]
+        )
+        # violation: error_rate | latency_p95; counted once per violation episode
+        self.slo_violations_total = Counter(
+            "llm_router_quality_slo_violations_total",
+            "SLO violations, counted when a violation starts",
+            labelnames=["violation"]
+        )
+        # counted at most once per model per hour
+        self.hotspot_detected_total = Counter(
+            "llm_router_quality_hotspot_detected_total",
+            "models detected as latency hotspots",
+            labelnames=["model"]
+        )
+        # P5 3.6 FeedbackCollector; rating is "1".."5" or "none"
+        self.feedback_submitted_total = Counter(
+            "llm_router_quality_feedback_submitted_total",
+            "user feedback records submitted",
+            labelnames=["type", "rating"]
+        )
+
+
 
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
@@ -414,8 +458,9 @@ RESOURCE_METRICS = ResourceMetrics()
 HEALTH_METRICS = HealthMetrics()
 ALERT_METRICS = AlertMetrics()
 
-# P5 added, execution policy
+# P5 added, execution policy + quality monitor
 POLICY_METRICS = PolicyMetrics()
+QUALITY_METRICS = QualityMetrics()
 
 # create once, then prometheus will register to the global.
 # load once at creation, then all the other modules share the same default registry

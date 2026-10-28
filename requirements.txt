@@ -20,6 +20,9 @@ loguru>=0.7
 
 # 指标采集
 prometheus-client>=0.19
+# P4 resource collection (GPU support is optional)
+psutil>=5.9
+GPUtil>=1.4.0; sys_platform != 'darwin'
 
 # CLI 命令框架
 click>=8.1

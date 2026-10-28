@@ -404,6 +404,20 @@ policy:
     estimated_only: true          # check using estimated_cost from router phase only, without executing inference
   refund_on_failure: true         # automatically refund quota on execute failure
 
+langgraph:
+  enabled: false                 # P5 master switch
+  use_simple_graph_fallback: true  # simple compatibility layer when langgraph package is missing
+  integrated_mode: true          # if enabled, POST /route can also internally switch to LangGraph (P5 optional, default disabled to keep P2 pass-through)
+  execution_path_audit: true     # every node must append
+  force_log_node_always: true    # force log route even on exceptions
+  nodes:
+    classify_enabled: true
+    compress_enabled: true
+    select_adapter_enabled: true # P5 placeholder, but execution path still displays it
+    fallback_enabled: true
+    max_node_retries: 1          # single node exception retry count
+  timeout_sec: 60                # ainvoke total timeout
+
 optimization:
   enabled: false
   kv_cache_size_gb: 8
@@ -413,20 +427,29 @@ optimization:
   tensorrt: false
 
 quality:
-  monitor:
-    enabled: false
-    window_size: 100
-    window_duration_seconds: 3600
+  enabled: false
+  rolling_window_minutes: 5
+  rolling_window_max_records: 10000
+  cache_ttl_sec: 10
+  slo:
+    error_rate_threshold: 0.05
+    latency_p95_threshold_ms: 3000
+  hotspot:
+    min_samples: 10
+    avg_latency_threshold_ms: 5000
+  report_to_alert_manager: true   # active alerting via P4 AlertManager on SLO violations
+  alert_severity: warning
 
-  slo_targets:
-    availability: 0.999
-    latency_p95_seconds: 2.0
-    error_rate_max: 0.01
-  
-  feedback:
-    storage_path: data/feedback
-  
-  health_check_interval_seconds: 30
+feedback:
+  enabled: false
+  storage_path: data/feedback/feedback.jsonl
+  lock_timeout_sec: 10
+  comment_max_length: 2000
+  allow_anonymous: true           # fill with anonymous when user_id is empty
+  dashboard:
+    default_window_minutes: 60
+    default_limit: 20
+    join_clickhouse_model: true   # if enabled, populate model in dashboard interface
 
 router_mode:
   use_integrated_router: false

@@ -21,6 +21,21 @@ from src.utils.logger import setup_logging, get_logger
 from src.utils.schema import QueryRequest, RoutingDecision, UserTier
 import src.utils.metrics
 
+# P5 soft imports: a missing P5 module must not stop the P2 service from starting (3.4 D).
+try:
+    from src.llm_router_part5_policy import ExecutionPolicy
+except ImportError:
+    ExecutionPolicy = None
+try:
+    from src.llm_router_part5_langgraph import IntegratedLLMRouter, LangGraphRouterOrchestrator
+except ImportError:
+    IntegratedLLMRouter = LangGraphRouterOrchestrator = None
+try:
+    from src.llm_router_part5_quality import FeedbackCollector, QualityMonitor
+    from src.llm_router_part5_schema import FeedbackRecord
+except ImportError:
+    FeedbackCollector = QualityMonitor = FeedbackRecord = None
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = str(PROJECT_ROOT / "config/config.yaml")
 
@@ -41,6 +56,36 @@ def _capture_routing_decision(route_query):
     return wrapper
 
 
+QUALITY_SLO_RULE = "QualitySLOViolation"
+
+# Decision: P5 SLO alerting hooks into the running AlertManager instead of editing P4 (same idea as
+# the route_query wrapper above). P4 picks rule values by rule name and rules_override replaces the
+# default rules, so the rule is appended and _evaluate_rule (private) is wrapped for that one name.
+def _attach_quality_alert_rule(alert_manager, quality_monitor, severity: str) -> None:
+    from src.llm_router_part4_monitor import AlertRule
+
+    evaluate_rule = alert_manager._evaluate_rule
+
+    @functools.wraps(evaluate_rule)
+    async def wrapper(rule):
+        if rule.name != QUALITY_SLO_RULE:
+            return await evaluate_rule(rule)
+        slo_ok, _ = quality_monitor.get_slo_status()
+        value = 0.0 if slo_ok else 1.0
+        return (value > rule.threshold, value)
+
+    alert_manager._evaluate_rule = wrapper
+    alert_manager.rules.append(AlertRule(
+        name=QUALITY_SLO_RULE,
+        expr_lambda_src="not quality_monitor.get_slo_status()[0]",
+        threshold=0.5,
+        duration_seconds=0,   # the SLO is already a rolling window; fire on the first failing eval
+        severity=severity,
+        description="P5 quality SLO violated (error rate or p95 latency over target)",
+        enabled=True,
+    ))
+
+
 try:
     from prometheus_client import make_asgi_app, start_http_server
     _PROM_AVAILABLE = True
@@ -57,6 +102,7 @@ class LLMRouterPlatform:
         load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
         self.config = self._load_config()
         self.services = {}
+        self._integrated_router = None  # P5 entry for /route/advanced, built in _initialize_services
         self._prom_server = None
         self._start_time = time.time()
         self._traffic_window: deque = deque(maxlen=100_000)
@@ -185,15 +231,69 @@ class LLMRouterPlatform:
 
             collector = SystemResourceCollector(self.config)
             await collector.initialize()
-            if collector.enabled:            
+            if collector.enabled:
                 await collector.start()
 
             self.services["monitor"] = collector
             alert = AlertManager(self.config, self.services)
             await alert.initialize()
-            if alert.enabled:                
+            if alert.enabled:
                 await alert.start()
             self.services["alert"] = alert
+
+        # P5 (after P4, so QualityMonitor can hook into AlertManager): quality -> policy -> LangGraph.
+        # Disabled sections log nothing: M1 greps the log for these names.
+        self._integrated_router = None
+        cfg_quality = self.config.get("quality", {})
+        if cfg_quality.get("enabled") and QualityMonitor is not None:
+            try:
+                quality = QualityMonitor(cfg_quality, alert_manager_ref=self.services.get("alert"))
+                await quality.initialize()
+                self.services["quality_monitor"] = quality
+                if cfg_quality.get("report_to_alert_manager") and "alert" in self.services:
+                    _attach_quality_alert_rule(self.services["alert"], quality,
+                                               cfg_quality.get("alert_severity", "warning"))
+            except Exception as exc:
+                self.logger.warning("QualityMonitor initialization skipped: %s", exc)
+
+        cfg_feedback = self.config.get("feedback", {})
+        if cfg_feedback.get("enabled") and FeedbackCollector is not None:
+            try:
+                feedback = FeedbackCollector(cfg_feedback, quality_monitor=self.services.get("quality_monitor"),
+                                             pipeline=self.services.get("pipeline"))
+                await feedback.initialize()
+                self.services["feedback"] = feedback
+            except Exception as exc:
+                self.logger.warning("FeedbackCollector initialization skipped: %s", exc)
+
+        cfg_policy = self.config.get("policy", {})
+        if cfg_policy.get("enabled") and ExecutionPolicy is not None:
+            try:
+                policy = ExecutionPolicy(cfg_policy)
+                await policy.initialize()
+                self.services["policy"] = policy
+            except Exception as exc:
+                self.logger.warning("ExecutionPolicy initialization skipped: %s", exc)
+
+        cfg_langgraph = self.config.get("langgraph", {})
+        if cfg_langgraph.get("enabled") and LangGraphRouterOrchestrator is not None:
+            try:
+                orchestrator = LangGraphRouterOrchestrator(
+                    cfg_langgraph,
+                    router=router,
+                    inference=inference,
+                    policy=self.services.get("policy"),
+                    quality_monitor=self.services.get("quality_monitor"),
+                    pipeline=self.services.get("pipeline"),
+                )
+                await orchestrator.initialize()
+                self.services["langgraph"] = orchestrator
+                # Decision: not registered in self.services, so it stays out of /health and /admin/services
+                self._integrated_router = IntegratedLLMRouter(
+                    router, inference, policy=self.services.get("policy"),
+                    orchestrator=orchestrator, quality_monitor=self.services.get("quality_monitor"))
+            except Exception as exc:
+                self.logger.warning("LangGraphRouterOrchestrator initialization skipped: %s", exc)
 
         # P4 Mode B: standalone Prometheus HTTP server
         monitoring_cfg = self.config.get("monitoring", {})
@@ -314,6 +414,7 @@ class LLMRouterPlatform:
     def _create_fastapi_app(self):
         from fastapi import FastAPI, HTTPException, Request
         from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.responses import JSONResponse
         app = FastAPI(
             title="LLM Router & Execution Platform",
             description="Production-grade multi-model deployment system with adaptive routing",
@@ -618,6 +719,97 @@ class LLMRouterPlatform:
                     self.logger.debug("errors_total write failed: %s", metric_exc)
                 self._record_traffic(is_error=True)
                 raise HTTPException(status_code=500, detail=str(exc))
+
+        @app.post("/route/advanced")
+        async def route_advanced(request: Request):
+            orchestrator = self.services.get("langgraph")
+            if orchestrator is None or not orchestrator.enabled:
+                raise HTTPException(status_code=501, detail="LangGraph disabled (langgraph.enabled=false)")
+            try:
+                request_received_at = datetime.now(timezone.utc)
+                payload = await request.json()
+                # same parsing and defaults as POST /route, so clients only change the URL
+                query_request = QueryRequest(
+                    query=payload.get("query"),
+                    user_id=payload.get("user_id"),
+                    user_tier=UserTier(payload.get("user_tier", "free")),
+                    context=payload.get("context"),
+                    max_tokens=payload.get("max_tokens", 512),
+                    temperature=payload.get("temperature", 1.0),
+                )
+                resp = await self._integrated_router.process_query_advanced(
+                    query_request, received_at=request_received_at)
+
+                # Decision: policy rejections and failed executions both return 200; success /
+                # policy_rejected / break_reason / error in the body carry the outcome (3.4 B.8).
+                # Only failed executions count as errors in the /status traffic window.
+                try:
+                    src.utils.metrics.SYSTEM_METRICS.requests_total.labels(
+                        endpoint="/route/advanced", method="POST", status="200"
+                    ).inc()
+                except Exception as metric_exc:
+                    self.logger.debug("requests_total write failed: %s", metric_exc)
+                self._record_traffic(is_error=not resp.success and not resp.policy_rejected)
+                return resp
+            except Exception as exc:
+                try:
+                    src.utils.metrics.SYSTEM_METRICS.errors_total.labels(
+                        component="api", error_type=type(exc).__name__
+                    ).inc()
+                except Exception as metric_exc:
+                    self.logger.debug("errors_total write failed: %s", metric_exc)
+                self._record_traffic(is_error=True)
+                raise HTTPException(status_code=500, detail=str(exc))
+
+        # P5 admin views; policy disabled -> 200 {"enabled": false}, like /admin/alerts/* returning []
+        @app.get("/admin/policy/state")
+        async def admin_policy_state(user_id: str, tier: str):
+            policy = self.services.get("policy")
+            if policy is None:
+                return {"enabled": False}
+            try:
+                user_tier = UserTier(tier.lower())
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"unknown tier: {tier}")
+            quota = await policy.get_user_quota(user_id, user_tier)
+            # breakers are per model, not per user: report the global one, as /route/advanced does
+            return {"enabled": True, **quota,
+                    "circuit_breaker": policy.circuit_breaker_for("global").get_status()}
+
+        @app.get("/admin/policy/tiers")
+        async def admin_policy_tiers():
+            policy = self.services.get("policy")
+            if policy is None:
+                return {"enabled": False}
+            return {"enabled": True, "tiers": policy.get_tiers()}
+
+        @app.get("/admin/policy/circuit-breakers")
+        async def admin_policy_circuit_breakers(name: Optional[str] = None):
+            policy = self.services.get("policy")
+            if policy is None:
+                return {"enabled": False}
+            return {"enabled": True, "circuit_breakers": policy.circuit_breaker_status(name)}
+
+        @app.post("/feedback", status_code=201)
+        async def submit_feedback(request: Request):
+            feedback = self.services.get("feedback")
+            if feedback is None:
+                # Decision: 200 + status=disabled, same style as /quality/dashboard when feedback is off
+                return JSONResponse(status_code=200, content={"status": "disabled"})
+            try:
+                payload = await request.json()
+                record = await feedback.submit(FeedbackRecord.model_validate(payload))
+            except ValueError as exc:
+                # bad JSON, schema errors (pydantic ValidationError is a ValueError) and submit() checks
+                raise HTTPException(status_code=400, detail=str(exc))
+            return {"status": "submitted", "feedback_id": str(record.feedback_id)}
+
+        @app.get("/quality/dashboard")
+        async def quality_dashboard(window_minutes: Optional[int] = None, limit: Optional[int] = None):
+            feedback = self.services.get("feedback")
+            if feedback is None:
+                return {"error": "feedback_disabled", "top_positive": [], "top_negative": [], "snapshot": None}
+            return await feedback.get_dashboard_data(window_minutes, limit)
 
         return app
         
